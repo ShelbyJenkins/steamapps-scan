@@ -10,7 +10,7 @@ use std::{
 };
 
 use super::{
-    paths::{ExecutablePath, FilePresence, RelativeExecutablePath},
+    paths::{ExecutablePath, FilePresence, RelativeExecutablePath, canonical_starts_with},
     report::{
         AppInstall, Diagnostic, DiagnosticKind, DiagnosticSeverity, Discovery, DiscoveryStage,
         SteamInventory,
@@ -287,10 +287,10 @@ impl MatchReport {
             "every executable match must retain one of the query's validated candidates"
         );
         debug_assert!(
-            matches.iter().all(|matched| matched
-                .executable()
-                .path()
-                .starts_with(matched.app().path())),
+            matches.iter().all(|matched| canonical_starts_with(
+                matched.executable().path(),
+                matched.app().path()
+            )),
             "every executable match must remain confined to its app installation"
         );
         Self {
@@ -541,7 +541,7 @@ impl AppInstall {
                     continue;
                 }
             };
-            if !executable.starts_with(self.path()) {
+            if !canonical_starts_with(&executable, self.path()) {
                 diagnostics.push(
                     Diagnostic::error(
                         DiscoveryStage::ResolveExecutable,

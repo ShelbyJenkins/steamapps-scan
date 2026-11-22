@@ -20,7 +20,7 @@ use crate::{
     MAX_STEAM_METADATA_BYTES,
     paths::{
         FilePresence, InstallDir, LibraryRoot, ManifestPath, SteamRoot, ValidationErrKind,
-        canonical_directory,
+        canonical_directory, canonical_starts_with,
     },
     report::{
         AppInstall, AppMetadata, AttemptEvidence, AttemptOutcome, Diagnostic, DiagnosticKind,
@@ -746,7 +746,7 @@ impl ScanPipeline {
                 return None;
             }
         };
-        if !resolved.starts_with(&canonical_common) {
+        if !canonical_starts_with(&resolved, &canonical_common) {
             self.diagnostics.push(
                 Diagnostic::warning(
                     DiscoveryStage::ValidateInstall,

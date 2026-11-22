@@ -305,6 +305,47 @@ pub fn canonical_directory(path: &Path, role: &str) -> Result<PathBuf, Validatio
     }
 }
 
+/// Whether canonical `path` lies at or under canonical `base`.
+///
+/// `dunce` keeps the verbatim `\\?\` prefix on a path too long for the plain
+/// form, so two canonical paths under one directory can differ in prefix
+/// alone. Prefixes are compared by the drive or share they name.
+pub fn canonical_starts_with(path: &Path, base: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::{
+            ffi::OsString,
+            path::{Component, Prefix},
+        };
+
+        let identity = |component: Component<'_>| match component {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::VerbatimDisk(drive) | Prefix::Disk(drive) => {
+                    OsString::from(format!("{}:", char::from(drive.to_ascii_uppercase())))
+                }
+                Prefix::VerbatimUNC(server, share) | Prefix::UNC(server, share) => {
+                    let mut unc = OsString::from(r"\\");
+                    unc.push(server);
+                    unc.push(r"\");
+                    unc.push(share);
+                    unc
+                }
+                Prefix::Verbatim(_) | Prefix::DeviceNS(_) => prefix.as_os_str().to_owned(),
+            },
+            other @ (Component::RootDir
+            | Component::CurDir
+            | Component::ParentDir
+            | Component::Normal(_)) => other.as_os_str().to_owned(),
+        };
+        let mut path_components = path.components().map(identity);
+        base.components()
+            .map(identity)
+            .all(|component| path_components.next() == Some(component))
+    }
+    #[cfg(not(windows))]
+    path.starts_with(base)
+}
+
 impl ManifestPath {
     /// Parse the app ID out of an `appmanifest_<id>.acf` file name, or
     /// `None` when the name does not follow the manifest convention.
