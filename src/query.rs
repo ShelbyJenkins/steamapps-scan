@@ -554,7 +554,7 @@ impl AppInstall {
                             executable.display(),
                         ),
                     )
-                    .with_path(path.clone())
+                    .with_path(path)
                     .with_app_id(query.app_id()),
                 );
                 continue;

@@ -11,7 +11,7 @@ fn discovers_an_arbitrary_app_without_libraryfolders() {
     let discovery = steam.discover();
 
     assert_eq!(discovery.state(), DiscoveryState::Complete);
-    assert!(discovery.diagnostics().is_empty());
+    assert_eq!(discovery.diagnostics(), []);
     assert_eq!(discovery.inventory().steam_roots().len(), 1);
     assert_eq!(discovery.inventory().libraries().len(), 1);
     let app = discovery
@@ -242,7 +242,7 @@ fn manifest_id_is_cross_checked_with_filename() {
     let discovery = steam.discover();
 
     assert_eq!(discovery.state(), DiscoveryState::Partial);
-    assert!(discovery.inventory().apps().is_empty());
+    assert_eq!(discovery.inventory().apps(), []);
     assert!(discovery.diagnostics().iter().any(|diagnostic| {
         diagnostic.kind == DiagnosticKind::InvalidData
             && diagnostic.message.contains("expected 30 from its filename")
@@ -261,7 +261,7 @@ fn reserved_zero_manifest_app_id_is_rejected() {
     let discovery = steam.discover();
 
     assert_eq!(discovery.state(), DiscoveryState::Partial);
-    assert!(discovery.inventory().apps().is_empty());
+    assert_eq!(discovery.inventory().apps(), []);
     assert!(discovery.diagnostics().iter().any(|diagnostic| {
         diagnostic.app_id.is_none()
             && diagnostic.kind == DiagnosticKind::InvalidData
@@ -281,7 +281,7 @@ fn manifest_install_dir_cannot_escape_common() {
     let discovery = steam.discover();
 
     assert_eq!(discovery.state(), DiscoveryState::Partial);
-    assert!(discovery.inventory().apps().is_empty());
+    assert_eq!(discovery.inventory().apps(), []);
     assert!(discovery.diagnostics().iter().any(|diagnostic| {
         diagnostic.kind == DiagnosticKind::OutsideBoundary
             && diagnostic.message.contains("escapes steamapps/common")
@@ -301,7 +301,7 @@ fn manifest_install_dir_cannot_claim_all_of_common() {
     let discovery = steam.discover();
 
     assert_eq!(discovery.state(), DiscoveryState::Partial);
-    assert!(discovery.inventory().apps().is_empty());
+    assert_eq!(discovery.inventory().apps(), []);
     assert!(discovery.diagnostics().iter().any(|diagnostic| {
         diagnostic.kind == DiagnosticKind::OutsideBoundary
             && diagnostic.message.contains("escapes steamapps/common")

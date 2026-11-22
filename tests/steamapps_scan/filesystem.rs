@@ -93,7 +93,7 @@ fn install_link_to_a_vanished_target_is_reported() {
     let discovery = steam.discover();
 
     assert_eq!(discovery.state(), DiscoveryState::Partial);
-    assert!(discovery.inventory().apps().is_empty());
+    assert_eq!(discovery.inventory().apps(), []);
     assert!(discovery.diagnostics().iter().any(|diagnostic| {
         diagnostic.stage == DiscoveryStage::ValidateInstall
             && diagnostic.kind == DiagnosticKind::NotFound
@@ -145,7 +145,7 @@ fn non_ascii_and_spaced_paths_resolve() {
         discovery.resolve_executable(&ExecutableQuery::new(APP_ID, "Bin Dir/Gämé.exe").unwrap());
 
     assert_eq!(discovery.state(), DiscoveryState::Complete);
-    assert!(discovery.diagnostics().is_empty());
+    assert_eq!(discovery.diagnostics(), []);
     let matched = report.unique().unwrap();
     assert_eq!(matched.app().name(), Some(NAME));
     assert_eq!(
