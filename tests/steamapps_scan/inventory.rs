@@ -1,95 +1,6 @@
-#![expect(
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::unwrap_used,
-    reason = "integration fixtures and assertions intentionally fail fast with local context"
-)]
+//! Inventory, query, and report contracts over explicit fixture roots.
 
-use std::{
-    num::{NonZeroU32, NonZeroU64},
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU32, Ordering},
-};
-
-#[cfg(windows)]
-use steamapps_scan::DiscoverySource;
-use steamapps_scan::{
-    AppMetadata, AttemptOutcome, DiagnosticKind, DiagnosticSeverity, Discovery, DiscoveryStage,
-    DiscoveryState, ExecutableQuery, ExecutableTarget, MAX_STEAM_METADATA_BYTES, MatchCardinality,
-    MatchCompleteness, MatchErr, QueryErr, StateFlags,
-};
-
-const fn fixture_app_id(raw: u32) -> NonZeroU32 {
-    NonZeroU32::new(raw).expect("fixture app ID is nonzero")
-}
-
-struct TempTree(PathBuf);
-
-impl TempTree {
-    fn new(label: &str) -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-        let path = std::env::temp_dir().join(format!(
-            "steamapps-scan-{label}-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed),
-        ));
-        std::fs::create_dir_all(&path).expect("create temporary tree");
-        Self(dunce::canonicalize(path).expect("canonicalize temporary tree"))
-    }
-
-    fn root(&self) -> &Path {
-        &self.0
-    }
-
-    fn dir(&self, relative: impl AsRef<Path>) -> PathBuf {
-        let path = self.0.join(relative);
-        std::fs::create_dir_all(&path).expect("create test directory");
-        path
-    }
-
-    fn file(&self, relative: impl AsRef<Path>, contents: &str) -> PathBuf {
-        let path = self.0.join(relative);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("create test file parent");
-        }
-        std::fs::write(&path, contents).expect("write test file");
-        path
-    }
-
-    fn manifest(
-        _filename_app_id: u32,
-        manifest_app_id: u32,
-        installdir: &str,
-        name: &str,
-    ) -> String {
-        format!(
-            "\"AppState\"\n{{\n\t\"appid\"\t\"{manifest_app_id}\"\n\t\"name\"\t\"{name}\"\n\t\"installdir\"\t\"{installdir}\"\n}}\n",
-        )
-    }
-
-    fn install_app(&self, app_id: u32, installdir: &str) -> PathBuf {
-        self.file(
-            format!("steamapps/appmanifest_{app_id}.acf"),
-            &Self::manifest(app_id, app_id, installdir, &format!("Test App {app_id}")),
-        );
-        self.dir(format!("steamapps/common/{installdir}"))
-    }
-
-    fn install_executable(&self, installdir: &str, relative: &str) -> PathBuf {
-        self.file(format!("steamapps/common/{installdir}/{relative}"), "")
-    }
-
-    fn discover(&self) -> Discovery {
-        Discovery::discover_from([self.root()])
-    }
-}
-
-impl Drop for TempTree {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use super::*;
 
 #[test]
 fn discovers_an_arbitrary_app_without_libraryfolders() {
@@ -324,7 +235,7 @@ fn manifest_id_is_cross_checked_with_filename() {
     let steam = TempTree::new("id-mismatch");
     steam.file(
         "steamapps/appmanifest_30.acf",
-        &TempTree::manifest(30, 31, "Mismatch", "Mismatch"),
+        TempTree::manifest(30, 31, "Mismatch", "Mismatch"),
     );
     steam.dir("steamapps/common/Mismatch");
 
@@ -343,7 +254,7 @@ fn reserved_zero_manifest_app_id_is_rejected() {
     let steam = TempTree::new("zero-app-id");
     steam.file(
         "steamapps/appmanifest_0.acf",
-        &TempTree::manifest(0, 0, "InvalidApp", "Invalid App"),
+        TempTree::manifest(0, 0, "InvalidApp", "Invalid App"),
     );
     steam.dir("steamapps/common/InvalidApp");
 
@@ -364,7 +275,7 @@ fn manifest_install_dir_cannot_escape_common() {
     let steam = TempTree::new("manifest-traversal");
     steam.file(
         format!("steamapps/appmanifest_{APP_ID}.acf"),
-        &TempTree::manifest(APP_ID, APP_ID, "../../outside", "Traversal"),
+        TempTree::manifest(APP_ID, APP_ID, "../../outside", "Traversal"),
     );
 
     let discovery = steam.discover();
@@ -383,7 +294,7 @@ fn manifest_install_dir_cannot_claim_all_of_common() {
     let steam = TempTree::new("manifest-dot");
     steam.file(
         format!("steamapps/appmanifest_{APP_ID}.acf"),
-        &TempTree::manifest(APP_ID, APP_ID, ".", "Dot"),
+        TempTree::manifest(APP_ID, APP_ID, ".", "Dot"),
     );
     steam.dir("steamapps/common");
 
@@ -429,7 +340,7 @@ fn libraryfolders_expands_all_libraries_and_deduplicates_slots() {
     library.install_app(APP_ID, "External");
     steam.file(
         "steamapps/libraryfolders.vdf",
-        &format!(
+        format!(
             "\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\"{}\"\n\t}}\n\t\"1\"\n\t{{\n\t\t\"path\"\t\"{}\"\n\t}}\n}}\n",
             library.root().display().to_string().replace('\\', r"\\"),
             library.root().display().to_string().replace('\\', r"\\"),
@@ -485,7 +396,7 @@ fn malformed_library_slot_does_not_hide_a_valid_sibling() {
     library.install_app(APP_ID, "SiblingApp");
     steam.file(
         "steamapps/libraryfolders.vdf",
-        &format!(
+        format!(
             "\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t}}\n\t\"1\"\n\t{{\n\t\t\"path\"\t\"{}\"\n\t}}\n}}\n",
             library.root().display().to_string().replace('\\', r"\\"),
         ),
@@ -515,7 +426,7 @@ fn wrong_type_library_is_classified_as_invalid_data() {
     let not_a_library = steam.file("not-a-library", "");
     steam.file(
         "steamapps/libraryfolders.vdf",
-        &format!(
+        format!(
             "\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\"{}\"\n\t}}\n}}\n",
             not_a_library.display().to_string().replace('\\', r"\\"),
         ),
@@ -569,7 +480,7 @@ fn manifest_metadata_is_parsed_leniently_and_serialized_sparsely() {
     let steam = TempTree::new("metadata-lenient");
     steam.file(
         format!("steamapps/appmanifest_{APP_ID}.acf"),
-        &format!(
+        format!(
             concat!(
                 "\"AppState\"\n{{\n",
                 "\t\"appid\"\t\"{app_id}\"\n",
@@ -670,7 +581,7 @@ fn ambiguous_numeric_depot_metadata_is_omitted_with_a_warning() {
     let steam = TempTree::new("metadata-ambiguous-depot");
     steam.file(
         format!("steamapps/appmanifest_{APP_ID}.acf"),
-        &format!(
+        format!(
             concat!(
                 "\"AppState\"\n{{\n",
                 "\t\"appid\"\t\"{app_id}\"\n",
@@ -710,7 +621,7 @@ fn unreadable_optional_metadata_keeps_the_app_with_a_warning() {
     let steam = TempTree::new("metadata-unreadable");
     steam.file(
         format!("steamapps/appmanifest_{APP_ID}.acf"),
-        &format!(
+        format!(
             concat!(
                 "\"AppState\"\n{{\n",
                 "\t\"appid\"\t\"{app_id}\"\n",
@@ -785,119 +696,4 @@ fn explicit_root_attempts_and_failures_are_retained() {
     let json = serde_json::to_value(&discovery).expect("serialize linked attempt diagnostic");
     assert_eq!(json["attempts"][0]["diagnostic_index"], 0);
     assert!(json["attempts"][0].get("detail").is_none());
-}
-
-#[cfg(feature = "cli")]
-#[test]
-fn cli_rejects_zero_app_ids_as_usage_errors() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_steamapps-scan"))
-        .args(["resolve", "0", "game.exe"])
-        .output()
-        .expect("run the steamapps-scan CLI");
-
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid value '0'"));
-}
-
-#[cfg(feature = "cli")]
-#[test]
-fn cli_reports_incomplete_explicit_discovery_with_exit_four() {
-    let fixture = TempTree::new("cli-partial-exit");
-    let missing_root = fixture.root().join("missing-root");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_steamapps-scan"))
-        .arg("--root")
-        .arg(&missing_root)
-        .arg("scan")
-        .output()
-        .expect("run the steamapps-scan CLI");
-
-    assert_eq!(output.status.code(), Some(4));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stdout.contains("rejected"));
-    assert!(stderr.contains(&missing_root.display().to_string()));
-}
-
-#[cfg(windows)]
-#[test]
-fn automatic_discovery_attempts_every_registry_location_and_view() {
-    let discovery = Discovery::discover();
-    let registry_sources = discovery
-        .attempts()
-        .iter()
-        .filter_map(|attempt| match &attempt.source {
-            DiscoverySource::Registry {
-                hive, key, view, ..
-            } => Some((hive.as_str(), key.as_str(), view.as_str())),
-            DiscoverySource::Explicit
-            | DiscoverySource::Process { .. }
-            | DiscoverySource::Environment { .. }
-            | DiscoverySource::Conventional { .. }
-            | _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    assert_eq!(registry_sources.len(), 3);
-    assert!(registry_sources.contains(&("HKCU", r"Software\Valve\Steam", "default")));
-    assert!(registry_sources.contains(&("HKLM", r"SOFTWARE\Valve\Steam", "32-bit")));
-    assert!(registry_sources.contains(&("HKLM", r"SOFTWARE\Valve\Steam", "64-bit")));
-}
-
-#[cfg(windows)]
-#[test]
-fn junctioned_install_is_accepted_but_executable_escape_is_rejected() {
-    const APP_ID: u32 = 70;
-    let steam = TempTree::new("junction-library");
-    let physical_install = TempTree::new("junction-install");
-    let outside = TempTree::new("junction-outside");
-    physical_install.file("inside.exe", "");
-    outside.file("outside.exe", "");
-    steam.file(
-        format!("steamapps/appmanifest_{APP_ID}.acf"),
-        &TempTree::manifest(APP_ID, APP_ID, "Junctioned", "Junctioned"),
-    );
-    let common = dunce::canonicalize(steam.dir("steamapps/common")).unwrap();
-    let install_link = common.join("Junctioned");
-    let install_status = std::process::Command::new("cmd")
-        .args([
-            "/C",
-            "mklink",
-            "/J",
-            &install_link.to_string_lossy(),
-            &physical_install.root().to_string_lossy(),
-        ])
-        .status()
-        .expect("create install junction");
-    assert!(install_status.success());
-    let escape_link = physical_install.root().join("escape");
-    let escape_status = std::process::Command::new("cmd")
-        .args([
-            "/C",
-            "mklink",
-            "/J",
-            &escape_link.to_string_lossy(),
-            &outside.root().to_string_lossy(),
-        ])
-        .status()
-        .expect("create executable escape junction");
-    assert!(escape_status.success());
-
-    let discovery = steam.discover();
-    assert_eq!(discovery.state(), DiscoveryState::Complete);
-    assert!(discovery.diagnostics().iter().any(|diagnostic| {
-        diagnostic.kind == DiagnosticKind::OutsideBoundary
-            && diagnostic.message.contains("accepted as a junction")
-    }));
-
-    let inside = discovery.resolve_executable(&ExecutableQuery::new(APP_ID, "inside.exe").unwrap());
-    assert_eq!(inside.cardinality(), MatchCardinality::One);
-
-    let escaped =
-        discovery.resolve_executable(&ExecutableQuery::new(APP_ID, "escape/outside.exe").unwrap());
-    assert_eq!(escaped.cardinality(), MatchCardinality::None);
-    assert_eq!(escaped.completeness(), MatchCompleteness::Partial);
-    assert!(escaped.diagnostics().any(|diagnostic| {
-        diagnostic.stage == DiscoveryStage::ResolveExecutable
-            && diagnostic.kind == DiagnosticKind::OutsideBoundary
-    }));
 }
