@@ -398,14 +398,12 @@ impl ScanPipeline {
             if slot.parse::<u32>().is_err() {
                 continue;
             }
-            let raw_path = values.first().and_then(|value| {
-                value
-                    .get_obj()
-                    .and_then(|folder| folder.get("path"))
-                    .and_then(|paths| paths.first())
-                    .and_then(|path| path.get_str())
-                    .or_else(|| value.get_str())
-            });
+            let raw_path = values
+                .first()
+                .and_then(|value| value.get_obj())
+                .and_then(|folder| folder.get("path"))
+                .and_then(|paths| paths.first())
+                .and_then(|path| path.get_str());
             let Some(raw_path) = raw_path else {
                 self.diagnostics.push(
                     Diagnostic::error(
