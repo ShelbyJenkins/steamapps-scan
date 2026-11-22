@@ -7,9 +7,11 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
+    fmt,
     io::Read,
     num::{NonZeroU32, NonZeroU64},
     path::{Component, Path, PathBuf},
+    str::FromStr,
 };
 
 use normalize_path::NormalizePath;
@@ -814,19 +816,99 @@ impl ScanPipeline {
             }
         };
 
+        let installed_depots = self.installed_depots(raw.installed_depots, manifest_path, app_id);
+        AppMetadata {
+            state_flags: self
+                .advisory_number(
+                    manifest_path,
+                    app_id,
+                    "StateFlags",
+                    raw.state_flags.as_deref(),
+                )
+                .map(StateFlags::from_raw),
+            build_id: self.advisory_number(
+                manifest_path,
+                app_id,
+                "buildid",
+                raw.buildid.as_deref(),
+            ),
+            size_on_disk: self.advisory_number(
+                manifest_path,
+                app_id,
+                "SizeOnDisk",
+                raw.size_on_disk.as_deref(),
+            ),
+            last_updated: self.advisory_number(
+                manifest_path,
+                app_id,
+                "LastUpdated",
+                raw.last_updated.as_deref(),
+            ),
+            beta_key: raw.user_config.and_then(|config| {
+                [config.beta_key, config.betakey]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|key| {
+                        let trimmed = key.trim();
+                        (!trimmed.is_empty()).then(|| trimmed.to_string())
+                    })
+            }),
+            installed_depots,
+        }
+    }
+
+    /// Advisory depots keyed by numeric depot ID. A key that is not a depot
+    /// ID, or that collides with another key after numeric parsing, is
+    /// omitted with a warning.
+    fn installed_depots(
+        &mut self,
+        raw_depots: BTreeMap<String, RawDepot>,
+        manifest_path: &ManifestPath,
+        app_id: NonZeroU32,
+    ) -> BTreeMap<NonZeroU64, InstalledDepot> {
         let mut installed_depots = BTreeMap::new();
         let mut ambiguous_depot_ids = HashSet::new();
-        for (raw_depot_id, depot) in raw.installed_depots {
-            let Ok(depot_id) = raw_depot_id.trim().parse::<NonZeroU64>() else {
-                continue;
+        for (raw_depot_id, depot) in raw_depots {
+            let depot_id = match raw_depot_id.trim().parse::<NonZeroU64>() {
+                Ok(depot_id) => depot_id,
+                Err(error) => {
+                    self.diagnostics.push(
+                        Diagnostic::warning(
+                            DiscoveryStage::ReadManifest,
+                            DiagnosticKind::InvalidData,
+                            format!(
+                                "{}: installed-depot key '{raw_depot_id}' is not a depot ID ({error}); omitted its advisory metadata",
+                                manifest_path.path().display()
+                            ),
+                        )
+                        .with_path(manifest_path.path())
+                        .with_app_id(app_id),
+                    );
+                    continue;
+                }
             };
             if ambiguous_depot_ids.contains(&depot_id) {
                 continue;
             }
             let parsed = InstalledDepot {
-                manifest: lenient_number(depot.manifest.as_ref()),
-                size: lenient_number(depot.size.as_ref()),
-                dlc_app_id: lenient_number(depot.dlcappid.as_ref()),
+                manifest: self.advisory_number(
+                    manifest_path,
+                    app_id,
+                    format_args!("InstalledDepots/{raw_depot_id}/manifest"),
+                    depot.manifest.as_deref(),
+                ),
+                size: self.advisory_number(
+                    manifest_path,
+                    app_id,
+                    format_args!("InstalledDepots/{raw_depot_id}/size"),
+                    depot.size.as_deref(),
+                ),
+                dlc_app_id: self.advisory_number(
+                    manifest_path,
+                    app_id,
+                    format_args!("InstalledDepots/{raw_depot_id}/dlcappid"),
+                    depot.dlcappid.as_deref(),
+                ),
             };
             if installed_depots.insert(depot_id, parsed).is_some() {
                 installed_depots.remove(&depot_id);
@@ -851,22 +933,38 @@ impl ScanPipeline {
                 .all(|depot_id| !installed_depots.contains_key(depot_id)),
             "ambiguous numeric depot IDs must not survive advisory parsing"
         );
+        installed_depots
+    }
 
-        AppMetadata {
-            state_flags: lenient_number(raw.state_flags.as_ref()).map(StateFlags::from_raw),
-            build_id: lenient_number(raw.buildid.as_ref()),
-            size_on_disk: lenient_number(raw.size_on_disk.as_ref()),
-            last_updated: lenient_number(raw.last_updated.as_ref()),
-            beta_key: raw.user_config.and_then(|config| {
-                [config.beta_key, config.betakey]
-                    .into_iter()
-                    .flatten()
-                    .find_map(|key| {
-                        let trimmed = key.trim();
-                        (!trimmed.is_empty()).then(|| trimmed.to_string())
-                    })
-            }),
-            installed_depots,
+    /// Parse one advisory number. A missing value is `None`. A present value
+    /// that does not parse, including a zero where Steam IDs are nonzero, is
+    /// also `None`, plus a warning naming `field`, so the omission stays
+    /// visible without costing the app its place in the inventory.
+    fn advisory_number<T: FromStr<Err: fmt::Display>>(
+        &mut self,
+        manifest_path: &ManifestPath,
+        app_id: NonZeroU32,
+        field: impl fmt::Display,
+        value: Option<&str>,
+    ) -> Option<T> {
+        let value = value?;
+        match value.trim().parse() {
+            Ok(parsed) => Some(parsed),
+            Err(error) => {
+                self.diagnostics.push(
+                    Diagnostic::warning(
+                        DiscoveryStage::ReadManifest,
+                        DiagnosticKind::InvalidData,
+                        format!(
+                            "{}: advisory field {field} value '{value}' was omitted: {error}",
+                            manifest_path.path().display()
+                        ),
+                    )
+                    .with_path(manifest_path.path())
+                    .with_app_id(app_id),
+                );
+                None
+            }
         }
     }
 }
@@ -916,10 +1014,6 @@ struct RawUserConfig {
     beta_key: Option<String>,
     #[serde(default)]
     betakey: Option<String>,
-}
-
-fn lenient_number<T: std::str::FromStr>(value: Option<&String>) -> Option<T> {
-    value.and_then(|value| value.trim().parse().ok())
 }
 
 /// Deduplication identity for a canonical root or library path.

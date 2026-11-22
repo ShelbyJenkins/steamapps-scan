@@ -102,6 +102,9 @@ cannot be parsed at all still enters the inventory with a warning
 diagnostic. `AppInstall::content_signal` remains the strict reader for
 callers that need the same fields verified. Depot keys that collide after
 numeric parsing are omitted as ambiguous and retain a warning diagnostic.
+A value that is present but malformed, including a zero build, depot,
+manifest, or DLC ID, and a depot key that is not a depot ID each leave a
+warning diagnostic naming what was omitted; a missing value leaves none.
 
 ## Executable versions
 

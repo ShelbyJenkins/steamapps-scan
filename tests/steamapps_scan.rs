@@ -601,8 +601,33 @@ fn manifest_metadata_is_parsed_leniently_and_serialized_sparsely() {
 
     let discovery = steam.discover();
 
+    // Each malformed advisory value is omitted with its own warning, never an
+    // inventory error, so the scan stays complete.
     assert_eq!(discovery.state(), DiscoveryState::Complete);
-    assert!(discovery.diagnostics().is_empty());
+    let warnings: Vec<&str> = discovery
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| {
+            assert_eq!(diagnostic.severity, DiagnosticSeverity::Warning);
+            assert_eq!(diagnostic.app_id, Some(fixture_app_id(APP_ID)));
+            diagnostic.message.as_str()
+        })
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        2,
+        "one warning per malformed value: {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|message| message.contains("advisory field SizeOnDisk value 'not-a-number'"))
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|message| message.contains("installed-depot key 'bogus' is not a depot ID"))
+    );
     let app = discovery
         .inventory()
         .apps_for(fixture_app_id(APP_ID))
