@@ -92,7 +92,8 @@ impl FileVersion {
     /// Linux. A file that is not a PE image carries no version resource and
     /// reports `Ok(None)`, as `GetFileVersionInfoW` does. A PE image whose
     /// headers point outside the file is an error: the resource may exist
-    /// but cannot be read.
+    /// but cannot be read. 16-bit executables are not read and report
+    /// `Ok(None)`.
     pub(crate) fn read(path: &Path) -> Result<Option<Self>, VersionErr> {
         let fail = |err: PeErr| VersionErr::new(path, err.to_string());
         let Some(mut resources) = PeResources::open(path).map_err(fail)? else {

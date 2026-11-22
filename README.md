@@ -128,8 +128,9 @@ The resource is optional, so an executable carrying none reports
 routinely disagree, so both are reported and neither is parsed:
 `VS_FIXEDFILEINFO` is four integers, while the string block is free text
 its author chose. Observed in the wild: `1.7.0.54`, `1, 0, 0, 1`,
-`01.00.00.02`, and a system library whose two records differ by 196
-build numbers. Vendors also leave one record empty while populating the
+`01.00.00.02`, and ARC Raiders, whose string is
+`pioneer_2.03.x-CL-1450810` while its fixed record reads `5.7.4.0`.
+Vendors also leave one record empty while populating the
 other, so an absent fixed record implies nothing about the strings.
 
 The resource is parsed from the file itself rather than through a Windows
