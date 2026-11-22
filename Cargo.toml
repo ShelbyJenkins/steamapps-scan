@@ -1,0 +1,89 @@
+[package]
+name = "steamapps-scan"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Generic Steam app inventory and executable discovery with validated paths and non-lossy diagnostics"
+readme = "README.md"
+repository = "https://github.com/ShelbyJenkins/steamapps-scan"
+documentation = "https://docs.rs/steamapps-scan"
+exclude = ["TODO.md"]
+keywords = ["steam", "appmanifest", "vdf", "discovery", "executable"]
+categories = ["config", "filesystem"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+# This crate parses untrusted Steam metadata and contains a narrow Windows FFI
+# boundary, so panic-prone operations and undocumented assumptions stay visible
+# here without imposing the policy on unrelated workspace members.
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Accepted noise, by decision rather than by drift.
+missing_errors_doc = "allow"     # error semantics live on the error enums
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+wildcard_imports = "allow"       # use super::*; is an accepted internal pattern, not a hazard
+
+# Panic and unchecked-operation review gates.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+panic_in_result_fn = "warn"
+indexing_slicing = "warn"
+string_slice = "warn"
+unchecked_time_subtraction = "warn"
+unreachable = "warn"
+unimplemented = "warn"
+todo = "warn"
+exit = "warn"
+arithmetic_side_effects = "warn"
+as_conversions = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+should_panic_without_expect = "warn"
+
+# Keep suppressions, unsafe assumptions, and API hazards reviewable.
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+missing_safety_doc = "warn"
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+fallible_impl_from = "warn"
+wildcard_enum_match_arm = "warn"
+unneeded_field_pattern = "warn"
+fn_params_excessive_bools = "warn"
+must_use_candidate = "warn"
+
+[features]
+cli = ["dep:clap", "dep:serde_json"]
+
+[[bin]]
+name = "steamapps-scan"
+path = "src/bin/steamapps-scan.rs"
+required-features = ["cli"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+keyvalues-serde = "0.2"
+normalize-path = "0.2"
+dunce = "1"
+clap = { version = "4.6.6", default-features = false, optional = true, features = [
+    "derive",
+    "error-context",
+    "help",
+    "std",
+    "suggestions",
+    "usage",
+] }
+serde_json = { version = "1", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+
+[dev-dependencies]
+serde_json = "1"

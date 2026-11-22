@@ -1,0 +1,4 @@
+# Tests intentionally use panic-based assertions, but helper code does not get
+# a blanket exemption: individual test modules acknowledge those paths with a
+# reasoned `#[expect]` instead.
+allow-unwrap-in-tests = false
