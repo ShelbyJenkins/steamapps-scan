@@ -132,7 +132,9 @@ its author chose. Observed in the wild: `1.7.0.54`, `1, 0, 0, 1`,
 build numbers. Vendors also leave one record empty while populating the
 other, so an absent fixed record implies nothing about the strings.
 
-Non-Windows targets report `Ok(None)`, so callers need no `cfg`.
+The resource is parsed from the file itself rather than through a Windows
+API, so every target reads it the same way, including Windows games
+installed through Proton on Linux, and callers need no `cfg`.
 
 ## Manual roots
 
