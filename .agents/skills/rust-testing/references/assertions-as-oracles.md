@@ -1,0 +1,15 @@
+# Assertions as test oracles
+
+An assertion is a reusable oracle, not a test driver. Every execution that reaches it checks the invariant: unit tests, integration tests, doctests, property tests, fuzzing, Miri, Loom, and ordinary debug runs. Tests supply executions; assertions decide correctness. Prefer strengthening the oracle beside the code over multiplying tests that restate it.
+
+Write each implementation-owned invariant exactly once, at its owning location: the constructor or mutation postcondition that establishes it, or immediately before the operation that relies on it. A unit test that restates an invariant an assertion already checks is redundant. The tests that remain prove the external contract, rejection behavior, and regressions, and drive execution through the asserted paths.
+
+Add the check only when the implementation owns the condition, the assertion can live at the owning location, the check is side-effect free, and it verifies something meaningfully independent: a relationship between fields, an inverse operation, a pre-state to post-state change, or agreement between separate representations. This pattern covers implementation-owned invariants only; external input still receives fallible validation, and safety- or integrity-critical conditions still hold in release builds.
+
+High-leverage locations: constructor and builder postconditions; length, count, range, ordering, and uniqueness changes in mutating operations; a freshly encoded value round-tripping through the trusted decoder; normalization results that must be canonical or idempotent; agreement between cached or derived values and their source; uniqueness and ordering of generated metadata; and runtime-checkable preconditions immediately before an unchecked operation.
+
+Prefer `debug_assert_eq!` and `debug_assert_ne!` so failures display both values, and give every assertion a message naming the violated invariant. Capture pre-state needed by a postcondition only in debug builds, perform the real operation normally, then compare. Keep expensive or allocating checks debug-only, and consolidate genuinely shared structural rules into one debug-only invariant-check method called after each mutation that can affect the structure; do not introduce a helper for one local assertion.
+
+Keep the oracle independent and non-recursive: compare against a lower-level decoder, a reference computation, or an already-computed representation, never the same expression on both sides, and never a fixture-specific expected value. Avoid assertions in drop paths, where a debug panic during unwinding can abort the process.
+
+Do not add noise: facts the type system or standard collections already guarantee, bounds that safe indexing already checks, checks immediately after code that trivially establishes the same condition, caller-controlled preconditions the implementation did not establish, duplicate copies of an invariant that has an owning location, or speculative checks without a concrete failure mode. Add only the highest-leverage assertions.
