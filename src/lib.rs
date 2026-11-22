@@ -13,10 +13,11 @@
 //! programs. A game and its dedicated server can share an app ID while using
 //! different executable queries.
 //!
-//! Automatic root location supports Windows and Linux, with macOS designed
-//! in but not yet validated against a real installation; other platforms
-//! report an unsupported state. [`Discovery::discover_from`] scans explicit
-//! roots with portable filesystem operations on any platform.
+//! Automatic root location supports Windows, Linux, and macOS; other
+//! platforms report an unsupported state. macOS has been validated against a
+//! default-location install; libraries on external volumes have not yet been
+//! exercised. [`Discovery::discover_from`] scans explicit roots with portable
+//! filesystem operations on any platform.
 //!
 //! ```no_run
 //! use steamapps_scan::{Discovery, ExecutableQuery};

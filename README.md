@@ -2,9 +2,10 @@
 
 A generic Rust crate and CLI for locating Steam installations, loading a
 validated inventory of installed apps, and finding executable paths by app ID
-plus exact relative path. Automatic discovery covers Windows and Linux, with
-macOS designed in but not yet validated against a real install; explicit-root
-scans work on all three.
+plus exact relative path. Automatic discovery covers Windows, Linux, and
+macOS; explicit-root scans work on all three. macOS has been validated against
+a default-location install; libraries on external volumes have not yet been
+exercised.
 
 ```rust,no_run
 use steamapps_scan::{Discovery, ExecutableQuery};
@@ -80,9 +81,9 @@ without a process probe. Only the modern lowercase `steamapps` layout is
 supported.
 
 On macOS, automatic discovery checks `~/Library/Application Support/Steam`,
-the only location the client uses for its data tree. The macOS path set is
-implemented from the documented layout but has not yet been validated against
-a real installation.
+the only location the client uses for its data tree. This has been validated
+against a default-location install; libraries on external volumes have not
+yet been exercised.
 
 Compared with [`steamlocate` 2.1.0](https://github.com/WilliamVenner/steamlocate-rs/tree/d7a249667ceeaadffba285547106e8d809507ae9),
 this crate is focused on broader root discovery, validated executable path
