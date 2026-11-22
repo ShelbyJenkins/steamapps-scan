@@ -327,7 +327,6 @@ mod process {
     /// Longest path the API can report: the extended-length limit in UTF-16
     /// units, comfortably above `MAX_PATH`.
     const IMAGE_PATH_CAPACITY: usize = 32 * 1024;
-    const IMAGE_PATH_LENGTH: u32 = 32 * 1024;
 
     #[expect(
         clippy::as_conversions,
@@ -466,9 +465,15 @@ mod process {
         let process = Handle(process);
 
         let mut buffer = vec![0u16; IMAGE_PATH_CAPACITY];
-        let mut length = IMAGE_PATH_LENGTH;
-        // SAFETY: `buffer` has `length` writable UTF-16 units and `length`
-        // is a valid in/out size for the call.
+        let mut length = u32::try_from(buffer.len()).map_err(|_| {
+            format!(
+                "path buffer of {} UTF-16 units exceeds the u32 size QueryFullProcessImageNameW accepts",
+                buffer.len()
+            )
+        })?;
+        // SAFETY: `length` is taken from `buffer.len()` just above, so the
+        // call may write at most `length` UTF-16 units into `buffer`, and
+        // `length` is a valid in/out size for the call.
         let ok = unsafe {
             QueryFullProcessImageNameW(process.0, 0, buffer.as_mut_ptr(), &raw mut length)
         };

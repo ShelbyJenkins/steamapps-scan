@@ -7,13 +7,13 @@
 //! serialized reports the library produces; the human output is a
 //! condensed view of the identical evidence.
 
-#![expect(
-    clippy::print_stderr,
-    clippy::print_stdout,
-    reason = "this binary's contract is to render reports and diagnostics on standard streams"
-)]
-
-use std::{fmt::Write as _, num::NonZeroU32, path::PathBuf, process::ExitCode};
+use std::{
+    fmt::Write as _,
+    io::{self, Write},
+    num::NonZeroU32,
+    path::PathBuf,
+    process::ExitCode,
+};
 
 use clap::{Parser, Subcommand};
 use steamapps_scan::{
@@ -32,6 +32,9 @@ const EXIT_AMBIGUOUS: u8 = 3;
 const EXIT_PARTIAL: u8 = 4;
 /// Automatic discovery is unavailable on this platform.
 const EXIT_UNSUPPORTED: u8 = 5;
+/// No result was produced: the requested value could not be derived, or
+/// the output could not be serialized or written.
+const EXIT_FAILED: u8 = 6;
 
 #[derive(Parser)]
 #[command(
@@ -39,7 +42,8 @@ const EXIT_UNSUPPORTED: u8 = 5;
     version,
     about = "Locate Steam installations and query the installed-app inventory",
     after_help = "Exit codes: 0 success, 1 nothing found, 2 usage error, \
-                  3 ambiguous result, 4 partial evidence, 5 platform unsupported."
+                  3 ambiguous result, 4 partial evidence, 5 platform unsupported, \
+                  6 no result produced."
 )]
 struct Cli {
     /// Scan these Steam roots instead of automatic platform discovery.
@@ -82,6 +86,18 @@ enum Command {
     },
 }
 
+/// Why a command could not deliver its output.
+enum OutputErr {
+    Write(io::Error),
+    Serialize(serde_json::Error),
+}
+
+impl From<io::Error> for OutputErr {
+    fn from(error: io::Error) -> Self {
+        Self::Write(error)
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let discovery = if cli.roots.is_empty() {
@@ -90,34 +106,69 @@ fn main() -> ExitCode {
         Discovery::discover_from(cli.roots.iter().cloned())
     };
 
-    let code = match cli.command {
-        Command::Scan => scan(&discovery, cli.json),
-        Command::Apps { app_id } => apps(&discovery, app_id, cli.json),
+    let mut out = io::stdout().lock();
+    let mut err = io::stderr().lock();
+    let result = match cli.command {
+        Command::Scan => scan(&discovery, cli.json, &mut out, &mut err),
+        Command::Apps { app_id } => apps(&discovery, app_id, cli.json, &mut out, &mut err),
         Command::Resolve {
             app_id,
             candidates,
             version,
-        } => resolve(&discovery, app_id, &candidates, version, cli.json),
-        Command::Signal { app_id } => signal(&discovery, app_id, cli.json),
+        } => resolve(
+            &discovery,
+            app_id,
+            &candidates,
+            version,
+            cli.json,
+            &mut out,
+            &mut err,
+        ),
+        Command::Signal { app_id } => signal(&discovery, app_id, cli.json, &mut out, &mut err),
+    };
+    let delivered = result.and_then(|code| {
+        out.flush()?;
+        Ok(code)
+    });
+    // Standard error is the last channel left, so a failure to report on it
+    // is dropped; the exit code still says no result was produced.
+    let code = match delivered {
+        Ok(code) => code,
+        // The reader closed standard output early, as `| head` does. It
+        // asked for less than the whole result, so there is nothing to tell.
+        Err(OutputErr::Write(error)) if error.kind() == io::ErrorKind::BrokenPipe => EXIT_FAILED,
+        Err(OutputErr::Write(error)) => {
+            let _ = writeln!(err, "could not write output: {error}");
+            EXIT_FAILED
+        }
+        Err(OutputErr::Serialize(error)) => {
+            let _ = writeln!(err, "could not serialize the report: {error}");
+            EXIT_FAILED
+        }
     };
     ExitCode::from(code)
 }
 
-fn scan(discovery: &Discovery, json: bool) -> u8 {
-    let output_complete = if json {
-        print_json(discovery)
+fn scan(
+    discovery: &Discovery,
+    json: bool,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> Result<u8, OutputErr> {
+    if json {
+        print_json(out, discovery)?;
     } else {
-        println!("state: {}", describe_state(discovery.state()));
+        writeln!(out, "state: {}", describe_state(discovery.state()))?;
         for root in discovery.inventory().steam_roots() {
-            println!("steam root: {root}");
+            writeln!(out, "steam root: {root}")?;
         }
         for library in discovery.inventory().libraries() {
-            println!("library: {library}");
+            writeln!(out, "library: {library}")?;
         }
         for app in discovery.inventory().apps() {
-            println!("{}", describe_app(app));
+            writeln!(out, "{}", describe_app(app))?;
         }
-        println!("attempts:");
+        writeln!(out, "attempts:")?;
         for (attempt, diagnostic) in discovery.attempts_with_diagnostics() {
             let source = describe_source(&attempt.source);
             let outcome = describe_outcome(attempt.outcome);
@@ -136,41 +187,48 @@ fn scan(discovery: &Discovery, json: bool) -> u8 {
                 line.push_str(" - ");
                 line.push_str(&diagnostic.message);
             }
-            println!("{line}");
+            writeln!(out, "{line}")?;
         }
-        print_diagnostics(discovery.diagnostics());
-        true
-    };
+        print_diagnostics(err, discovery.diagnostics())?;
+    }
     let result = match discovery.state() {
         DiscoveryState::Complete => EXIT_OK,
         DiscoveryState::NotFound => EXIT_NONE,
         DiscoveryState::Unsupported => EXIT_UNSUPPORTED,
         DiscoveryState::Partial | _ => EXIT_PARTIAL,
     };
-    final_code(discovery, result, output_complete)
+    Ok(final_code(discovery, result, true))
 }
 
-fn apps(discovery: &Discovery, app_id: Option<NonZeroU32>, json: bool) -> u8 {
+fn apps(
+    discovery: &Discovery,
+    app_id: Option<NonZeroU32>,
+    json: bool,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> Result<u8, OutputErr> {
     let selected: Vec<&AppInstall> = discovery
         .inventory()
         .apps()
         .iter()
         .filter(|app| app_id.is_none_or(|wanted| app.app_id() == wanted.get()))
         .collect();
-    let output_complete = if json {
-        print_json(&selected)
+    if json {
+        print_json(out, &selected)?;
     } else {
         for app in &selected {
-            println!("{}", describe_app(app));
+            writeln!(out, "{}", describe_app(app))?;
         }
-        true
-    };
+    }
+    // The app list carries no diagnostics of its own; these explain a
+    // partial exit code.
+    print_diagnostics(err, discovery.diagnostics())?;
     let result = if selected.is_empty() {
         EXIT_NONE
     } else {
         EXIT_OK
     };
-    final_code(discovery, result, output_complete)
+    Ok(final_code(discovery, result, true))
 }
 
 fn resolve(
@@ -179,12 +237,14 @@ fn resolve(
     candidates: &[PathBuf],
     version: bool,
     json: bool,
-) -> u8 {
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> Result<u8, OutputErr> {
     let query = match ExecutableQuery::any_of(app_id.get(), candidates.iter().cloned()) {
         Ok(query) => query,
         Err(error) => {
-            eprintln!("invalid executable query: {error}");
-            return 2;
+            writeln!(err, "invalid executable query: {error}")?;
+            return Ok(2);
         }
     };
     let report = discovery.resolve_executable(&query);
@@ -198,71 +258,85 @@ fn resolve(
         Vec::new()
     };
 
-    let output_complete = if json {
-        print_json(&ResolveOutput {
-            report: &report,
-            versions: &versions,
-        })
+    if json {
+        print_json(
+            out,
+            &ResolveOutput {
+                report: &report,
+                versions: &versions,
+            },
+        )?;
     } else {
         for found in report.matches() {
-            println!(
+            writeln!(
+                out,
                 "app {} ({}): {}",
                 found.app().app_id(),
                 found.app().name().unwrap_or("unnamed"),
                 found.executable()
-            );
+            )?;
         }
         for entry in &versions {
-            println!("{}", entry.describe());
+            writeln!(out, "{}", entry.describe())?;
         }
-        print_diagnostics_iter(report.diagnostics());
-        true
-    };
+        print_diagnostics_iter(err, report.diagnostics())?;
+    }
     let result = match report.cardinality() {
         MatchCardinality::One => EXIT_OK,
         MatchCardinality::None => EXIT_NONE,
         MatchCardinality::Many | _ => EXIT_AMBIGUOUS,
     };
-    let evidence_complete = output_complete
-        && report.completeness() == MatchCompleteness::Complete
+    let evidence_complete = report.completeness() == MatchCompleteness::Complete
         && versions.iter().all(VersionOutput::is_complete);
-    final_code(discovery, result, evidence_complete)
+    Ok(final_code(discovery, result, evidence_complete))
 }
 
-fn signal(discovery: &Discovery, app_id: NonZeroU32, json: bool) -> u8 {
+fn signal(
+    discovery: &Discovery,
+    app_id: NonZeroU32,
+    json: bool,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> Result<u8, OutputErr> {
     let app_id = app_id.get();
+    // The signal carries no diagnostics of its own; these explain a missing
+    // app or a partial exit code.
+    print_diagnostics(err, discovery.diagnostics())?;
     let installs: Vec<&AppInstall> = discovery.inventory().apps_for(app_id).collect();
     let app = match installs.as_slice() {
         [app] => app,
         [] => {
-            eprintln!("app {app_id} is not present in the loaded inventory");
-            return final_code(discovery, EXIT_NONE, true);
+            writeln!(err, "app {app_id} is not present in the loaded inventory")?;
+            return Ok(final_code(discovery, EXIT_NONE, true));
         }
         many => {
-            eprintln!(
+            writeln!(
+                err,
                 "app {app_id} has {} installations; a signal needs exactly one",
                 many.len()
-            );
-            return final_code(discovery, EXIT_AMBIGUOUS, true);
+            )?;
+            return Ok(final_code(discovery, EXIT_AMBIGUOUS, true));
         }
     };
     match app.content_signal() {
         Ok(signal) => {
-            let output_complete = if json {
-                print_json(&serde_json::json!({
-                    "app_id": app_id,
-                    "scheme": signal.scheme(),
-                    "value": signal.value(),
-                }))
+            if json {
+                print_json(
+                    out,
+                    &serde_json::json!({
+                        "app_id": app_id,
+                        "scheme": signal.scheme(),
+                        "value": signal.value(),
+                    }),
+                )?;
             } else {
-                println!("{} {}", signal.scheme(), signal.value());
-                true
-            };
-            final_code(discovery, EXIT_OK, output_complete)
+                writeln!(out, "{} {}", signal.scheme(), signal.value())?;
+            }
+            Ok(final_code(discovery, EXIT_OK, true))
         }
         Err(error) => {
-            eprintln!("could not derive a content signal: {error}");
-            EXIT_PARTIAL
+            writeln!(err, "could not derive a content signal: {error}")?;
+            Ok(EXIT_FAILED)
         }
     }
 }
@@ -411,27 +485,31 @@ fn describe_source(source: &DiscoverySource) -> String {
     }
 }
 
-fn print_diagnostics(diagnostics: &[Diagnostic]) {
-    print_diagnostics_iter(diagnostics.iter());
+fn print_diagnostics(err: &mut impl Write, diagnostics: &[Diagnostic]) -> io::Result<()> {
+    print_diagnostics_iter(err, diagnostics.iter())
 }
 
-fn print_diagnostics_iter<'a>(diagnostics: impl Iterator<Item = &'a Diagnostic>) {
+fn print_diagnostics_iter<'a>(
+    err: &mut impl Write,
+    diagnostics: impl Iterator<Item = &'a Diagnostic>,
+) -> io::Result<()> {
     for diagnostic in diagnostics {
         let severity = match diagnostic.severity {
             DiagnosticSeverity::Error => "error",
             DiagnosticSeverity::Warning => "warning",
             _ => "diagnostic",
         };
-        eprintln!("[{severity}] {}", diagnostic.message);
+        writeln!(err, "[{severity}] {}", diagnostic.message)?;
     }
+    Ok(())
 }
 
-fn final_code(discovery: &Discovery, result: u8, output_complete: bool) -> u8 {
+fn final_code(discovery: &Discovery, result: u8, evidence_complete: bool) -> u8 {
     final_code_for(
         discovery.state(),
         discovery.has_errors(),
         result,
-        output_complete,
+        evidence_complete,
     )
 }
 
@@ -439,28 +517,21 @@ const fn final_code_for(
     state: DiscoveryState,
     has_errors: bool,
     result: u8,
-    output_complete: bool,
+    evidence_complete: bool,
 ) -> u8 {
     if matches!(state, DiscoveryState::Unsupported) {
         EXIT_UNSUPPORTED
-    } else if !output_complete || has_errors {
+    } else if !evidence_complete || has_errors {
         EXIT_PARTIAL
     } else {
         result
     }
 }
 
-fn print_json(value: &impl serde::Serialize) -> bool {
-    match serde_json::to_string_pretty(value) {
-        Ok(text) => {
-            println!("{text}");
-            true
-        }
-        Err(error) => {
-            eprintln!("could not serialize the report: {error}");
-            false
-        }
-    }
+fn print_json(out: &mut impl Write, value: &impl serde::Serialize) -> Result<(), OutputErr> {
+    let text = serde_json::to_string_pretty(value).map_err(OutputErr::Serialize)?;
+    writeln!(out, "{text}")?;
+    Ok(())
 }
 
 #[cfg(test)]

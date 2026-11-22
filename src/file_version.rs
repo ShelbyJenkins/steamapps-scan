@@ -109,7 +109,7 @@ impl VersionErr {
 
 #[cfg(windows)]
 mod windows {
-    use std::{ffi::c_void, marker::PhantomData, os::windows::ffi::OsStrExt, path::Path};
+    use std::{ffi::c_void, os::windows::ffi::OsStrExt, path::Path};
 
     use super::{FileVersion, VersionErr};
 
@@ -202,9 +202,10 @@ mod windows {
                 format!("GetFileVersionInfoW failed with OS error {code}"),
             ));
         }
+        let block = VersionBlock(block);
 
         let mut version = FileVersion {
-            fixed_product_version: fixed_product_version(&block),
+            fixed_product_version: block.fixed_product_version(),
             ..FileVersion::default()
         };
 
@@ -212,24 +213,23 @@ mod windows {
         // agree on which they use, so the file's own translation table picks
         // it; falling back to US-English/Unicode covers resources that omit
         // the table.
-        let translations = translations(&block);
+        let translations = block.translations();
         for (language, code_page) in translations
             .iter()
             .copied()
             .chain(std::iter::once((0x0409, 0x04B0)))
         {
             if version.product_version.is_none() {
-                version.product_version =
-                    string_value(&block, language, code_page, "ProductVersion");
+                version.product_version = block.string_value(language, code_page, "ProductVersion");
             }
             if version.file_version.is_none() {
-                version.file_version = string_value(&block, language, code_page, "FileVersion");
+                version.file_version = block.string_value(language, code_page, "FileVersion");
             }
             if version.product_name.is_none() {
-                version.product_name = string_value(&block, language, code_page, "ProductName");
+                version.product_name = block.string_value(language, code_page, "ProductName");
             }
             if version.company_name.is_none() {
-                version.company_name = string_value(&block, language, code_page, "CompanyName");
+                version.company_name = block.string_value(language, code_page, "CompanyName");
             }
             if version.product_version.is_some()
                 && version.file_version.is_some()
@@ -246,134 +246,135 @@ mod windows {
         Ok(Some(version))
     }
 
-    /// Borrowed view of one value inside a `GetFileVersionInfoW` buffer.
-    struct QueryValue<'block> {
-        buffer: *const u8,
-        len: usize,
-        _block: PhantomData<&'block [u8]>,
+    /// How `VerQueryValueW` counts the length of the value it points at.
+    #[derive(Clone, Copy)]
+    enum ValueLength {
+        /// Binary values such as `\` and `\VarFileInfo\Translation`.
+        Bytes,
+        /// String-table values.
+        Utf16Units,
     }
 
-    /// Query one sub-block. The returned value cannot outlive `block`, whose
-    /// allocation owns the pointed-to bytes according to `VerQueryValueW`.
-    fn query<'block>(block: &'block [u8], sub_block: &str) -> Option<QueryValue<'block>> {
-        let sub_block = wide(sub_block);
-        let mut buffer: *mut c_void = std::ptr::null_mut();
-        let mut len = 0u32;
-        // SAFETY: `block` is the buffer a successful GetFileVersionInfoW
-        // filled, `sub_block` is NUL-terminated, and both out-params are
-        // valid writable locations. The borrow of `block` is tied to the
-        // returned pointer by the signature's lifetime.
-        let ok = unsafe {
-            VerQueryValueW(
-                block.as_ptr().cast::<c_void>(),
-                sub_block.as_ptr(),
-                &raw mut buffer,
-                &raw mut len,
-            )
-        };
-        if ok == 0 || buffer.is_null() || len == 0 {
-            return None;
-        }
-        Some(QueryValue {
-            buffer: buffer.cast_const().cast(),
-            len: usize::try_from(len).ok()?,
-            _block: PhantomData,
-        })
-    }
+    /// A version-information block filled by a successful
+    /// `GetFileVersionInfoW`. Only `read` builds one, so `VerQueryValueW`
+    /// only ever walks headers the OS wrote.
+    struct VersionBlock(Vec<u8>);
 
-    fn fixed_product_version(block: &[u8]) -> Option<[u16; 4]> {
-        let value = query(block, "\\")?;
-        // VS_FIXEDFILEINFO is 13 u32 fields; product version occupies the
-        // fifth and sixth.
-        if value.len < size_of::<[u32; 6]>() {
-            return None;
+    impl VersionBlock {
+        /// Return the bytes of one sub-block's value, or `None` when the
+        /// value is absent or does not lie entirely inside this block.
+        fn query(&self, sub_block: &str, length: ValueLength) -> Option<&[u8]> {
+            let sub_block = wide(sub_block);
+            let mut buffer: *mut c_void = std::ptr::null_mut();
+            let mut len = 0u32;
+            // SAFETY: `self.0` was filled by a successful GetFileVersionInfoW,
+            // the only way a VersionBlock is built, `sub_block` is
+            // NUL-terminated, and both out-params are valid writable
+            // locations.
+            let ok = unsafe {
+                VerQueryValueW(
+                    self.0.as_ptr().cast::<c_void>(),
+                    sub_block.as_ptr(),
+                    &raw mut buffer,
+                    &raw mut len,
+                )
+            };
+            if ok == 0 || buffer.is_null() || len == 0 {
+                return None;
+            }
+            let len = usize::try_from(len).ok()?;
+            let byte_len = match length {
+                ValueLength::Bytes => len,
+                ValueLength::Utf16Units => len.checked_mul(size_of::<u16>())?,
+            };
+            // Slice by offset rather than trusting the returned pointer, so a
+            // value reaching outside the block is rejected in release builds.
+            let offset = buffer.addr().checked_sub(self.0.as_ptr().addr())?;
+            let end = offset.checked_add(byte_len)?;
+            self.0.get(offset..end)
         }
-        // SAFETY: VerQueryValueW reported `value.len` readable bytes that
-        // remain alive through the borrowed block. A byte slice imposes no
-        // foreign-pointer alignment requirement.
-        let bytes = unsafe { std::slice::from_raw_parts(value.buffer, value.len) };
-        let field = |index: usize| {
-            let offset = index.checked_mul(size_of::<u32>())?;
-            let end = offset.checked_add(size_of::<u32>())?;
-            let raw = bytes.get(offset..end)?;
-            Some(u32::from_ne_bytes(raw.try_into().ok()?))
-        };
-        if field(0)? != VS_FFI_SIGNATURE {
-            return None;
-        }
-        let most = field(4)?;
-        let least = field(5)?;
-        let parts = [
-            u16::try_from(most >> 16).ok()?,
-            u16::try_from(most & 0xFFFF).ok()?,
-            u16::try_from(least >> 16).ok()?,
-            u16::try_from(least & 0xFFFF).ok()?,
-        ];
-        if parts == [0, 0, 0, 0] {
-            // Reforger leaves this record zeroed while publishing real
-            // strings; reporting 0.0.0.0 as a version would be a lie.
-            return None;
-        }
-        Some(parts)
-    }
 
-    fn translations(block: &[u8]) -> Vec<(u16, u16)> {
-        let Some(value) = query(block, "\\VarFileInfo\\Translation") else {
-            return Vec::new();
-        };
-        // SAFETY: VerQueryValueW reports the translation-array length in
-        // bytes and keeps those bytes alive through the borrowed block.
-        // Reading byte chunks avoids an alignment assumption.
-        let bytes = unsafe { std::slice::from_raw_parts(value.buffer, value.len) };
-        let chunks = bytes.chunks_exact(size_of::<[u16; 2]>());
-        if !chunks.remainder().is_empty() {
-            return Vec::new();
+        fn fixed_product_version(&self) -> Option<[u16; 4]> {
+            let bytes = self.query("\\", ValueLength::Bytes)?;
+            // VS_FIXEDFILEINFO is 13 u32 fields; product version occupies the
+            // fifth and sixth.
+            if bytes.len() < size_of::<[u32; 6]>() {
+                return None;
+            }
+            let field = |index: usize| {
+                let offset = index.checked_mul(size_of::<u32>())?;
+                let end = offset.checked_add(size_of::<u32>())?;
+                let raw = bytes.get(offset..end)?;
+                Some(u32::from_ne_bytes(raw.try_into().ok()?))
+            };
+            if field(0)? != VS_FFI_SIGNATURE {
+                return None;
+            }
+            let most = field(4)?;
+            let least = field(5)?;
+            let parts = [
+                u16::try_from(most >> 16).ok()?,
+                u16::try_from(most & 0xFFFF).ok()?,
+                u16::try_from(least >> 16).ok()?,
+                u16::try_from(least & 0xFFFF).ok()?,
+            ];
+            if parts == [0, 0, 0, 0] {
+                // Reforger leaves this record zeroed while publishing real
+                // strings; reporting 0.0.0.0 as a version would be a lie.
+                return None;
+            }
+            Some(parts)
         }
-        let expected_count = chunks.len();
-        let translations = chunks
-            .filter_map(|pair| <[u8; 4]>::try_from(pair).ok())
-            .map(
-                |[language_low, language_high, code_page_low, code_page_high]| {
-                    (
-                        u16::from_ne_bytes([language_low, language_high]),
-                        u16::from_ne_bytes([code_page_low, code_page_high]),
-                    )
-                },
-            )
-            .collect::<Vec<_>>();
-        debug_assert_eq!(
-            translations.len(),
-            expected_count,
-            "every exact translation chunk must decode to one language/code-page pair"
-        );
-        translations
-    }
 
-    fn string_value(block: &[u8], language: u16, code_page: u16, name: &str) -> Option<String> {
-        let sub_block = format!("\\StringFileInfo\\{language:04x}{code_page:04x}\\{name}");
-        let value = query(block, &sub_block)?;
-        let byte_len = value.len.checked_mul(size_of::<u16>())?;
-        // SAFETY: for a string value VerQueryValueW reports `value.len`
-        // readable UTF-16 units that stay alive through the borrowed block.
-        // A byte slice imposes no foreign-pointer alignment requirement.
-        let bytes = unsafe { std::slice::from_raw_parts(value.buffer, byte_len) };
-        let chunks = bytes.chunks_exact(size_of::<u16>());
-        if !chunks.remainder().is_empty() {
-            return None;
+        fn translations(&self) -> Vec<(u16, u16)> {
+            let Some(bytes) = self.query("\\VarFileInfo\\Translation", ValueLength::Bytes) else {
+                return Vec::new();
+            };
+            let chunks = bytes.chunks_exact(size_of::<[u16; 2]>());
+            if !chunks.remainder().is_empty() {
+                return Vec::new();
+            }
+            let expected_count = chunks.len();
+            let translations = chunks
+                .filter_map(|pair| <[u8; 4]>::try_from(pair).ok())
+                .map(
+                    |[language_low, language_high, code_page_low, code_page_high]| {
+                        (
+                            u16::from_ne_bytes([language_low, language_high]),
+                            u16::from_ne_bytes([code_page_low, code_page_high]),
+                        )
+                    },
+                )
+                .collect::<Vec<_>>();
+            debug_assert_eq!(
+                translations.len(),
+                expected_count,
+                "every exact translation chunk must decode to one language/code-page pair"
+            );
+            translations
         }
-        let expected_count = chunks.len();
-        let raw = chunks
-            .filter_map(|unit| <[u8; 2]>::try_from(unit).ok())
-            .map(u16::from_ne_bytes)
-            .collect::<Vec<_>>();
-        debug_assert_eq!(
-            raw.len(),
-            expected_count,
-            "every exact UTF-16 byte chunk must decode to one code unit"
-        );
-        let trimmed = raw.split(|unit| *unit == 0).next().unwrap_or(&raw);
-        let value = String::from_utf16_lossy(trimmed).trim().to_owned();
-        if value.is_empty() { None } else { Some(value) }
+
+        fn string_value(&self, language: u16, code_page: u16, name: &str) -> Option<String> {
+            let sub_block = format!("\\StringFileInfo\\{language:04x}{code_page:04x}\\{name}");
+            let bytes = self.query(&sub_block, ValueLength::Utf16Units)?;
+            let chunks = bytes.chunks_exact(size_of::<u16>());
+            if !chunks.remainder().is_empty() {
+                return None;
+            }
+            let expected_count = chunks.len();
+            let raw = chunks
+                .filter_map(|unit| <[u8; 2]>::try_from(unit).ok())
+                .map(u16::from_ne_bytes)
+                .collect::<Vec<_>>();
+            debug_assert_eq!(
+                raw.len(),
+                expected_count,
+                "every exact UTF-16 byte chunk must decode to one code unit"
+            );
+            let trimmed = raw.split(|unit| *unit == 0).next().unwrap_or(&raw);
+            let value = String::from_utf16_lossy(trimmed).trim().to_owned();
+            if value.is_empty() { None } else { Some(value) }
+        }
     }
 }
 

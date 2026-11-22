@@ -137,9 +137,7 @@ impl SteamRoot {
         let steamapps = root.join("steamapps");
         canonical_directory(&steamapps, "Steam apps directory")?;
 
-        let library_folders = steamapps.join(Self::LIBRARY_FOLDERS_FILE);
-        let has_library_folders =
-            matches!(FilePresence::of(&library_folders), FilePresence::Present(_));
+        let library_folders = FilePresence::of(&steamapps.join(Self::LIBRARY_FOLDERS_FILE));
         let entries = std::fs::read_dir(&steamapps).map_err(|error| {
             ValidationErr::new(
                 ValidationErrKind::Io,
@@ -165,8 +163,16 @@ impl SteamRoot {
             has_manifest |= ManifestPath::app_id_in_file_name(&entry.file_name()).is_some();
         }
 
-        if !has_library_folders && !has_manifest {
-            return Err(ValidationErr::new(
+        // A manifest is enough to accept the root; the inventory scan then
+        // reports an unusable libraryfolders.vdf as its own diagnostic.
+        if has_manifest {
+            return Ok(Self(root));
+        }
+        match library_folders {
+            FilePresence::Present(_) => Ok(Self(root)),
+            // Without a manifest, the unusable file is why the root fails.
+            FilePresence::Invalid(error) => Err(error),
+            FilePresence::Missing => Err(ValidationErr::new(
                 ValidationErrKind::NotSteamLayout,
                 &root,
                 format!(
@@ -174,10 +180,8 @@ impl SteamRoot {
                     steamapps.display(),
                     Self::LIBRARY_FOLDERS_FILE,
                 ),
-            ));
+            )),
         }
-
-        Ok(Self(root))
     }
 }
 

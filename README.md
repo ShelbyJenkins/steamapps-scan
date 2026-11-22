@@ -21,7 +21,7 @@ if let Ok(found) = report.unique() {
     println!("{}", found.executable());
 }
 
-# Ok::<(), Box<dyn std::error::Error>>(())
+# Ok::<(), steamapps_scan::QueryErr>(())
 ```
 
 ## Why inventory first?
