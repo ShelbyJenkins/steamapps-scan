@@ -1,3 +1,6 @@
+//! steamapps-scan - Scan pipeline
+//! ===============================
+//!
 //! Steam root pipeline: candidate collection, library expansion, and
 //! generic app-manifest loading. Root candidates come from the per-platform
 //! sources in `providers`.
@@ -5,7 +8,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     io::Read,
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroU64},
     path::{Component, Path, PathBuf},
 };
 
@@ -18,9 +21,9 @@ use crate::{
         canonical_directory,
     },
     report::{
-        AppInstall, AppMetadata, AttemptOutcome, Diagnostic, DiagnosticKind, Discovery,
-        DiscoveryAttempt, DiscoverySource, DiscoveryStage, InstalledDepot, StateFlags,
-        SteamInventory,
+        AppInstall, AppMetadata, AttemptEvidence, AttemptOutcome, Diagnostic, DiagnosticKind,
+        Discovery, DiscoveryAttempt, DiscoverySource, DiscoveryStage, InstalledDepot,
+        MetadataReadErr, StateFlags, SteamInventory,
     },
 };
 
@@ -37,18 +40,14 @@ pub struct SteamScan {
 impl SteamScan {
     pub fn automatic() -> Self {
         let mut collector = RootCollector::default();
-        super::providers::automatic_roots(&mut collector);
+        collector.automatic_roots();
         Self::from_root_scan(collector.finish())
     }
 
     pub fn explicit(candidates: impl IntoIterator<Item = PathBuf>) -> Self {
         let mut collector = RootCollector::default();
         for candidate in candidates {
-            collector.candidate(
-                DiscoverySource::Explicit,
-                candidate,
-                RejectionRecord::Diagnostic,
-            );
+            collector.candidate(DiscoverySource::Explicit, candidate);
         }
         Self::from_root_scan(collector.finish())
     }
@@ -92,30 +91,53 @@ impl SteamScan {
     }
 }
 
-struct RootScan {
-    roots: Vec<SteamRoot>,
-    attempts: Vec<DiscoveryAttempt>,
-    diagnostics: Vec<Diagnostic>,
-}
+/// Read one Steam metadata file, refusing anything that is not a regular
+/// UTF-8 file within [`MAX_STEAM_METADATA_BYTES`].
+pub fn read_metadata(path: &Path) -> Result<String, MetadataReadErr> {
+    let metadata = std::fs::metadata(path).map_err(|source| MetadataReadErr::Inspect {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(MetadataReadErr::NotFile {
+            path: path.to_path_buf(),
+        });
+    }
+    if metadata.len() > MAX_STEAM_METADATA_BYTES {
+        return Err(MetadataReadErr::TooLarge {
+            path: path.to_path_buf(),
+        });
+    }
 
-/// How a candidate's validation failure is recorded.
-#[derive(Clone, Copy)]
-pub(super) enum RejectionRecord {
-    /// Escalate to an error-severity diagnostic: the candidate was supplied
-    /// by the caller, so failing to validate it makes the result incomplete.
-    Diagnostic,
-    /// Note the failure as attempt detail only: the candidate was a
-    /// speculative provider guess, and most missing or malformed guesses are
-    /// expected. I/O failures still become diagnostics because they may hide
-    /// a real root.
-    AttemptDetail,
+    let file = std::fs::File::open(path).map_err(|source| MetadataReadErr::Open {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    // Capacity is only a hint; one extra byte may be read to detect a file
+    // that grew after the metadata check.
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or_default());
+    file.take(READ_LIMIT)
+        .read_to_end(&mut bytes)
+        .map_err(|source| MetadataReadErr::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if u64::try_from(bytes.len()).map_or(true, |len| len > MAX_STEAM_METADATA_BYTES) {
+        return Err(MetadataReadErr::TooLarge {
+            path: path.to_path_buf(),
+        });
+    }
+    String::from_utf8(bytes).map_err(|error| MetadataReadErr::NotUtf8 {
+        path: path.to_path_buf(),
+        source: error.utf8_error(),
+    })
 }
 
 /// Shared accumulator for the per-platform providers: every candidate,
 /// rejection, and source failure lands here so the attempts ledger stays
 /// non-lossy regardless of which platform produced it.
 #[derive(Default)]
-pub(super) struct RootCollector {
+pub struct RootCollector {
     roots: Vec<SteamRoot>,
     attempts: Vec<DiscoveryAttempt>,
     diagnostics: Vec<Diagnostic>,
@@ -123,35 +145,35 @@ pub(super) struct RootCollector {
 }
 
 impl RootCollector {
-    pub(super) fn candidate(
-        &mut self,
-        source: DiscoverySource,
-        candidate: PathBuf,
-        rejection: RejectionRecord,
-    ) {
+    pub fn candidate(&mut self, source: DiscoverySource, candidate: PathBuf) {
+        let rejection = match &source {
+            DiscoverySource::Explicit => RejectionRecord::Diagnostic,
+            DiscoverySource::Registry { .. }
+            | DiscoverySource::Process { .. }
+            | DiscoverySource::Environment { .. }
+            | DiscoverySource::Conventional { .. } => RejectionRecord::AttemptDetail,
+        };
         if !matches!(&source, DiscoverySource::Explicit) && !candidate.is_absolute() {
             self.attempts.push(DiscoveryAttempt {
                 source,
                 candidate: Some(candidate),
                 outcome: AttemptOutcome::Rejected,
-                detail: Some(
+                evidence: Some(AttemptEvidence::Detail(
                     "automatic root candidates must be absolute so discovery is independent of the process directory"
                         .into(),
-                ),
-                diagnostic_index: None,
+                )),
             });
             return;
         }
         match SteamRoot::from_dir(&candidate) {
             Ok(root) => {
-                let key = path_key(root.path());
+                let key = PathKey::of(root.path());
                 if self.seen.insert(key) {
                     self.attempts.push(DiscoveryAttempt {
                         source,
                         candidate: Some(candidate),
                         outcome: AttemptOutcome::Accepted,
-                        detail: None,
-                        diagnostic_index: None,
+                        evidence: None,
                     });
                     self.roots.push(root);
                 } else {
@@ -159,15 +181,16 @@ impl RootCollector {
                         source,
                         candidate: Some(candidate),
                         outcome: AttemptOutcome::Duplicate,
-                        detail: Some("root was already accepted from another source".into()),
-                        diagnostic_index: None,
+                        evidence: Some(AttemptEvidence::Detail(
+                            "root was already accepted from another source".into(),
+                        )),
                     });
                 }
             }
             Err(error) => {
                 let retain_diagnostic = matches!(rejection, RejectionRecord::Diagnostic)
                     || error.kind == ValidationErrKind::Io;
-                let (detail, diagnostic_index) = if retain_diagnostic {
+                let evidence = if retain_diagnostic {
                     let diagnostic_index = self.diagnostics.len();
                     self.diagnostics.push(
                         Diagnostic::error(
@@ -178,34 +201,32 @@ impl RootCollector {
                         .with_path(candidate.clone())
                         .with_source(source.clone()),
                     );
-                    (None, Some(diagnostic_index))
+                    AttemptEvidence::DiagnosticIndex(diagnostic_index)
                 } else {
-                    (Some(error.to_string()), None)
+                    AttemptEvidence::Detail(error.to_string())
                 };
                 self.attempts.push(DiscoveryAttempt {
                     source,
                     candidate: Some(candidate),
                     outcome: AttemptOutcome::Rejected,
-                    detail,
-                    diagnostic_index,
+                    evidence: Some(evidence),
                 });
             }
         }
     }
 
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-    pub(super) fn not_present(&mut self, source: DiscoverySource, detail: impl Into<String>) {
+    pub fn not_present(&mut self, source: DiscoverySource, detail: impl Into<String>) {
         self.attempts.push(DiscoveryAttempt {
             source,
             candidate: None,
             outcome: AttemptOutcome::NotPresent,
-            detail: Some(detail.into()),
-            diagnostic_index: None,
+            evidence: Some(AttemptEvidence::Detail(detail.into())),
         });
     }
 
     #[cfg(any(windows, target_os = "linux"))]
-    pub(super) fn rejected_without_candidate(
+    pub fn rejected_without_candidate(
         &mut self,
         source: DiscoverySource,
         detail: impl Into<String>,
@@ -214,13 +235,12 @@ impl RootCollector {
             source,
             candidate: None,
             outcome: AttemptOutcome::Rejected,
-            detail: Some(detail.into()),
-            diagnostic_index: None,
+            evidence: Some(AttemptEvidence::Detail(detail.into())),
         });
     }
 
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-    pub(super) fn unsupported(&mut self, source: DiscoverySource, message: &str) {
+    pub fn unsupported(&mut self, source: DiscoverySource, message: &str) {
         let diagnostic_index = self.diagnostics.len();
         self.diagnostics.push(
             Diagnostic::error(
@@ -234,13 +254,12 @@ impl RootCollector {
             source,
             candidate: None,
             outcome: AttemptOutcome::Unsupported,
-            detail: None,
-            diagnostic_index: Some(diagnostic_index),
+            evidence: Some(AttemptEvidence::DiagnosticIndex(diagnostic_index)),
         });
     }
 
     #[cfg(windows)]
-    pub(super) fn failed(&mut self, source: DiscoverySource, detail: impl Into<String>) {
+    pub fn failed(&mut self, source: DiscoverySource, detail: impl Into<String>) {
         let detail = detail.into();
         let diagnostic_index = self.diagnostics.len();
         self.diagnostics.push(
@@ -251,8 +270,7 @@ impl RootCollector {
             source,
             candidate: None,
             outcome: AttemptOutcome::Failed,
-            detail: None,
-            diagnostic_index: Some(diagnostic_index),
+            evidence: Some(AttemptEvidence::DiagnosticIndex(diagnostic_index)),
         });
     }
 
@@ -263,6 +281,25 @@ impl RootCollector {
             diagnostics: self.diagnostics,
         }
     }
+}
+
+struct RootScan {
+    roots: Vec<SteamRoot>,
+    attempts: Vec<DiscoveryAttempt>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+/// How a candidate's validation failure is recorded.
+#[derive(Clone, Copy)]
+enum RejectionRecord {
+    /// Escalate to an error-severity diagnostic: the candidate was supplied
+    /// by the caller, so failing to validate it makes the result incomplete.
+    Diagnostic,
+    /// Note the failure as attempt detail only: the candidate was a
+    /// speculative provider guess, and most missing or malformed guesses are
+    /// expected. I/O failures still become diagnostics because they may hide
+    /// a real root.
+    AttemptDetail,
 }
 
 /// Library expansion and manifest loading over validated roots. Owns the
@@ -281,7 +318,7 @@ impl ScanPipeline {
         }
 
         let mut seen = HashSet::new();
-        libraries.retain(|library| seen.insert(path_key(library.path())));
+        libraries.retain(|library| seen.insert(PathKey::of(library.path())));
         libraries
     }
 
@@ -302,10 +339,11 @@ impl ScanPipeline {
                 return Vec::new();
             }
         };
-        let text = match read_metadata(&path, DiscoveryStage::ReadLibraryFolders, None) {
+        let text = match read_metadata(&path) {
             Ok(text) => text,
-            Err(diagnostic) => {
-                self.diagnostics.push(*diagnostic);
+            Err(error) => {
+                self.diagnostics
+                    .push(error.into_diagnostic(DiscoveryStage::ReadLibraryFolders, None));
                 return Vec::new();
             }
         };
@@ -504,8 +542,7 @@ impl ScanPipeline {
                         manifest_path.display()
                     ),
                 )
-                .with_path(manifest_path)
-                .with_app_id(filename_app_id),
+                .with_path(manifest_path),
             );
             return None;
         };
@@ -521,7 +558,7 @@ impl ScanPipeline {
                         ),
                     )
                     .with_path(manifest_path)
-                    .with_app_id(filename_app_id),
+                    .with_app_id(app_id),
                 );
                 return None;
             }
@@ -531,31 +568,24 @@ impl ScanPipeline {
                 self.diagnostics.push(
                     Diagnostic::error(DiscoveryStage::ReadManifest, kind, error.to_string())
                         .with_path(manifest_path)
-                        .with_app_id(filename_app_id),
+                        .with_app_id(app_id),
                 );
                 return None;
             }
         };
-        let text = match read_metadata(
-            manifest_path.path(),
-            DiscoveryStage::ReadManifest,
-            Some(filename_app_id),
-        ) {
+        let text = match read_metadata(manifest_path.path()) {
             Ok(text) => text,
-            Err(diagnostic) => {
-                self.diagnostics.push(*diagnostic);
+            Err(error) => {
+                self.diagnostics
+                    .push(error.into_diagnostic(DiscoveryStage::ReadManifest, Some(app_id)));
                 return None;
             }
         };
-        let manifest = self.manifest_identity(&text, &manifest_path, filename_app_id)?;
-        let (manifest_install_dir, install_dir) = self.resolve_install_dir(
-            library,
-            &manifest.installdir,
-            &manifest_path,
-            filename_app_id,
-        )?;
+        let manifest = self.manifest_identity(&text, &manifest_path, app_id)?;
+        let (manifest_install_dir, install_dir) =
+            self.resolve_install_dir(library, &manifest.installdir, &manifest_path, app_id)?;
 
-        let metadata = self.app_metadata(&text, &manifest_path, filename_app_id);
+        let metadata = self.app_metadata(&text, &manifest_path, app_id);
         Some(AppInstall::from_scanned(
             app_id,
             manifest.name.and_then(|name| {
@@ -576,7 +606,7 @@ impl ScanPipeline {
         &mut self,
         text: &str,
         manifest_path: &ManifestPath,
-        filename_app_id: u32,
+        app_id: NonZeroU32,
     ) -> Option<AppManifest> {
         let (manifest, root_key): (AppManifest, _) = match keyvalues_serde::from_str_with_key(text)
         {
@@ -589,11 +619,11 @@ impl ScanPipeline {
                         format!(
                             "{}: could not parse app manifest for app {}: {error}",
                             manifest_path.path().display(),
-                            filename_app_id
+                            app_id
                         ),
                     )
                     .with_path(manifest_path.path())
-                    .with_app_id(filename_app_id),
+                    .with_app_id(app_id),
                 );
                 return None;
             }
@@ -609,11 +639,11 @@ impl ScanPipeline {
                     ),
                 )
                 .with_path(manifest_path.path())
-                .with_app_id(filename_app_id),
+                .with_app_id(app_id),
             );
             return None;
         }
-        if manifest.appid != filename_app_id {
+        if manifest.appid != app_id.get() {
             self.diagnostics.push(
                 Diagnostic::error(
                     DiscoveryStage::ReadManifest,
@@ -622,11 +652,11 @@ impl ScanPipeline {
                         "{}: manifest app ID is {}, expected {} from its filename",
                         manifest_path.path().display(),
                         manifest.appid,
-                        filename_app_id
+                        app_id
                     ),
                 )
                 .with_path(manifest_path.path())
-                .with_app_id(filename_app_id),
+                .with_app_id(app_id),
             );
             return None;
         }
@@ -642,7 +672,7 @@ impl ScanPipeline {
         library: &LibraryRoot,
         manifest_install_dir: &str,
         manifest_path: &ManifestPath,
-        filename_app_id: u32,
+        app_id: NonZeroU32,
     ) -> Option<(String, InstallDir)> {
         let declared = manifest_install_dir.trim();
         if declared.is_empty() {
@@ -656,7 +686,7 @@ impl ScanPipeline {
                     ),
                 )
                 .with_path(manifest_path.path())
-                .with_app_id(filename_app_id),
+                .with_app_id(app_id),
             );
             return None;
         }
@@ -672,7 +702,7 @@ impl ScanPipeline {
                 )
             })
         {
-            self.reject_install_dir_escape(manifest_path, filename_app_id, manifest_install_dir);
+            self.reject_install_dir_escape(manifest_path, app_id, manifest_install_dir);
             return None;
         }
 
@@ -680,7 +710,7 @@ impl ScanPipeline {
         let normalized_common = common.normalize();
         let candidate = common.join(raw_install).normalize();
         if !candidate.starts_with(&normalized_common) {
-            self.reject_install_dir_escape(manifest_path, filename_app_id, manifest_install_dir);
+            self.reject_install_dir_escape(manifest_path, app_id, manifest_install_dir);
             return None;
         }
         let canonical_common = match canonical_directory(&common, "Steam common directory") {
@@ -690,7 +720,7 @@ impl ScanPipeline {
                 self.diagnostics.push(
                     Diagnostic::error(DiscoveryStage::ValidateInstall, kind, error.to_string())
                         .with_path(common)
-                        .with_app_id(filename_app_id),
+                        .with_app_id(app_id),
                 );
                 return None;
             }
@@ -707,11 +737,11 @@ impl ScanPipeline {
                         format!(
                             "{}: resolved installation for app {} is unusable: {error}",
                             manifest_path.path().display(),
-                            filename_app_id
+                            app_id
                         ),
                     )
                     .with_path(candidate)
-                    .with_app_id(filename_app_id),
+                    .with_app_id(app_id),
                 );
                 return None;
             }
@@ -724,13 +754,13 @@ impl ScanPipeline {
                     format!(
                         "{}: app {} installation resolves outside '{}' to '{}'; accepted as a junction or symlinked install",
                         manifest_path.path().display(),
-                        filename_app_id,
+                        app_id,
                         canonical_common.display(),
                         resolved.display(),
                     ),
                 )
                 .with_path(candidate)
-                .with_app_id(filename_app_id),
+                .with_app_id(app_id),
             );
         }
         Some((declared.to_string(), InstallDir(resolved)))
@@ -739,7 +769,7 @@ impl ScanPipeline {
     fn reject_install_dir_escape(
         &mut self,
         manifest_path: &ManifestPath,
-        filename_app_id: u32,
+        app_id: NonZeroU32,
         manifest_install_dir: &str,
     ) {
         self.diagnostics.push(
@@ -749,12 +779,12 @@ impl ScanPipeline {
                 format!(
                     "{}: app {} installdir '{}' escapes steamapps/common",
                     manifest_path.path().display(),
-                    filename_app_id,
+                    app_id,
                     manifest_install_dir
                 ),
             )
             .with_path(manifest_path.path())
-            .with_app_id(filename_app_id),
+            .with_app_id(app_id),
         );
     }
 
@@ -762,7 +792,7 @@ impl ScanPipeline {
         &mut self,
         text: &str,
         manifest_path: &ManifestPath,
-        app_id: u32,
+        app_id: NonZeroU32,
     ) -> AppMetadata {
         let raw = match keyvalues_serde::from_str_with_key::<RawMetadata>(text) {
             Ok((raw, _)) => raw,
@@ -787,7 +817,7 @@ impl ScanPipeline {
         let mut installed_depots = BTreeMap::new();
         let mut ambiguous_depot_ids = HashSet::new();
         for (raw_depot_id, depot) in raw.installed_depots {
-            let Ok(depot_id) = raw_depot_id.trim().parse::<u64>() else {
+            let Ok(depot_id) = raw_depot_id.trim().parse::<NonZeroU64>() else {
                 continue;
             };
             if ambiguous_depot_ids.contains(&depot_id) {
@@ -892,124 +922,32 @@ fn lenient_number<T: std::str::FromStr>(value: Option<&String>) -> Option<T> {
     value.and_then(|value| value.trim().parse().ok())
 }
 
-pub fn read_metadata(
-    path: &Path,
-    stage: DiscoveryStage,
-    app_id: Option<u32>,
-) -> Result<String, Box<Diagnostic>> {
-    let metadata = std::fs::metadata(path).map_err(|error| {
-        Box::new(
-            Diagnostic::error(
-                stage,
-                DiagnosticKind::Io,
-                format!(
-                    "{}: could not inspect metadata file: {error}",
-                    path.display()
-                ),
-            )
-            .with_path(path)
-            .with_app_id(app_id),
-        )
-    })?;
-    if !metadata.is_file() {
-        return Err(Box::new(
-            Diagnostic::error(
-                stage,
-                DiagnosticKind::InvalidData,
-                format!("{}: metadata path is not a regular file", path.display()),
-            )
-            .with_path(path)
-            .with_app_id(app_id),
-        ));
-    }
-    if metadata.len() > MAX_STEAM_METADATA_BYTES {
-        return Err(Box::new(
-            Diagnostic::error(
-                stage,
-                DiagnosticKind::InvalidData,
-                format!(
-                    "{}: metadata exceeds the {}-byte limit",
-                    path.display(),
-                    MAX_STEAM_METADATA_BYTES
-                ),
-            )
-            .with_path(path)
-            .with_app_id(app_id),
-        ));
-    }
-
-    let file = std::fs::File::open(path).map_err(|error| {
-        Box::new(
-            Diagnostic::error(
-                stage,
-                DiagnosticKind::Io,
-                format!("{}: could not open metadata file: {error}", path.display()),
-            )
-            .with_path(path)
-            .with_app_id(app_id),
-        )
-    })?;
-    // Capacity is only a hint; one extra byte may be read to detect a file
-    // that grew after the metadata check.
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or_default());
-    file.take(READ_LIMIT)
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            Box::new(
-                Diagnostic::error(
-                    stage,
-                    DiagnosticKind::Io,
-                    format!("{}: could not read metadata file: {error}", path.display()),
-                )
-                .with_path(path)
-                .with_app_id(app_id),
-            )
-        })?;
-    if u64::try_from(bytes.len()).map_or(true, |len| len > MAX_STEAM_METADATA_BYTES) {
-        return Err(Box::new(
-            Diagnostic::error(
-                stage,
-                DiagnosticKind::InvalidData,
-                format!(
-                    "{}: metadata exceeds the {}-byte limit",
-                    path.display(),
-                    MAX_STEAM_METADATA_BYTES
-                ),
-            )
-            .with_path(path)
-            .with_app_id(app_id),
-        ));
-    }
-    String::from_utf8(bytes).map_err(|error| {
-        Box::new(
-            Diagnostic::error(
-                stage,
-                DiagnosticKind::InvalidData,
-                format!("{}: metadata is not valid UTF-8: {error}", path.display()),
-            )
-            .with_path(path)
-            .with_app_id(app_id),
-        )
-    })
-}
-
+/// Deduplication identity for a canonical root or library path.
 #[cfg(any(windows, target_os = "macos"))]
-type PathKey = String;
-#[cfg(not(any(windows, target_os = "macos")))]
-type PathKey = PathBuf;
+#[derive(Eq, Hash, PartialEq)]
+struct PathKey(String);
 
-/// NTFS and default APFS are case-insensitive, so deduplication folds case
-/// on Windows and macOS. On a case-sensitive APFS volume two roots that
-/// differ only by case would merge; the attempts ledger still records both.
-#[cfg(any(windows, target_os = "macos"))]
-fn path_key(path: &Path) -> PathKey {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
-        .collect::<Vec<_>>()
-        .join("\0")
-}
-
+/// Deduplication identity for a canonical root or library path.
 #[cfg(not(any(windows, target_os = "macos")))]
-fn path_key(path: &Path) -> PathKey {
-    path.to_path_buf()
+#[derive(Eq, Hash, PartialEq)]
+struct PathKey(PathBuf);
+
+impl PathKey {
+    /// NTFS and default APFS are case-insensitive, so deduplication folds case
+    /// on Windows and macOS. On a case-sensitive APFS volume two roots that
+    /// differ only by case would merge; the attempts ledger still records both.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn of(path: &Path) -> Self {
+        Self(
+            path.components()
+                .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+                .collect::<Vec<_>>()
+                .join("\0"),
+        )
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn of(path: &Path) -> Self {
+        Self(path.to_path_buf())
+    }
 }

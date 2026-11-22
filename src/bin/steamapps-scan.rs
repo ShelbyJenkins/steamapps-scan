@@ -22,20 +22,6 @@ use steamapps_scan::{
     MatchCompleteness, MatchReport,
 };
 
-/// The requested result was produced.
-const EXIT_OK: u8 = 0;
-/// The run was valid but found nothing: no Steam, no apps, or no match.
-const EXIT_NONE: u8 = 1;
-/// More than one result matched a request that needs exactly one.
-const EXIT_AMBIGUOUS: u8 = 3;
-/// A result was produced, but failures may have hidden evidence.
-const EXIT_PARTIAL: u8 = 4;
-/// Automatic discovery is unavailable on this platform.
-const EXIT_UNSUPPORTED: u8 = 5;
-/// No result was produced: the requested value could not be derived, or
-/// the output could not be serialized or written.
-const EXIT_FAILED: u8 = 6;
-
 #[derive(Parser)]
 #[command(
     name = "steamapps-scan",
@@ -86,6 +72,82 @@ enum Command {
     },
 }
 
+/// Process exit status, from the codes listed in the help text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Exit {
+    /// The requested result was produced.
+    Success,
+    /// The run was valid but found nothing: no Steam, no apps, or no match.
+    NothingFound,
+    /// The command-line input was invalid.
+    Usage,
+    /// More than one result matched a request that needs exactly one.
+    Ambiguous,
+    /// A result was produced, but failures may have hidden evidence.
+    Partial,
+    /// Automatic discovery is unavailable on this platform.
+    Unsupported,
+    /// No result was produced: the requested value could not be derived, or
+    /// the output could not be serialized or written.
+    Failed,
+}
+
+impl Exit {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Success => 0,
+            Self::NothingFound => 1,
+            Self::Usage => 2,
+            Self::Ambiguous => 3,
+            Self::Partial => 4,
+            Self::Unsupported => 5,
+            Self::Failed => 6,
+        }
+    }
+
+    /// Apply the scan's own evidence on top of a command's result.
+    fn after_discovery(self, discovery: &Discovery, evidence: Evidence) -> Self {
+        let evidence = if discovery.has_errors() {
+            Evidence::Partial
+        } else {
+            evidence
+        };
+        self.after_evidence(discovery.state(), evidence)
+    }
+
+    /// An unsupported platform outranks everything; partial evidence then
+    /// outranks the command's own result.
+    const fn after_evidence(self, state: DiscoveryState, evidence: Evidence) -> Self {
+        if matches!(state, DiscoveryState::Unsupported) {
+            Self::Unsupported
+        } else if matches!(evidence, Evidence::Partial) {
+            Self::Partial
+        } else {
+            self
+        }
+    }
+}
+
+impl From<Exit> for ExitCode {
+    fn from(exit: Exit) -> Self {
+        Self::from(exit.code())
+    }
+}
+
+/// Whether every source a command relied on was inspected successfully.
+#[derive(Clone, Copy)]
+enum Evidence {
+    Complete,
+    Partial,
+}
+
+/// How a command renders its result on standard output.
+#[derive(Clone, Copy)]
+enum OutputFormat {
+    Human,
+    Json,
+}
+
 /// Why a command could not deliver its output.
 enum OutputErr {
     Write(io::Error),
@@ -100,6 +162,11 @@ impl From<io::Error> for OutputErr {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let format = if cli.json {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Human
+    };
     let discovery = if cli.roots.is_empty() {
         Discovery::discover()
     } else {
@@ -109,8 +176,8 @@ fn main() -> ExitCode {
     let mut out = io::stdout().lock();
     let mut err = io::stderr().lock();
     let result = match cli.command {
-        Command::Scan => scan(&discovery, cli.json, &mut out, &mut err),
-        Command::Apps { app_id } => apps(&discovery, app_id, cli.json, &mut out, &mut err),
+        Command::Scan => scan(&discovery, format, &mut out, &mut err),
+        Command::Apps { app_id } => apps(&discovery, app_id, format, &mut out, &mut err),
         Command::Resolve {
             app_id,
             candidates,
@@ -120,115 +187,117 @@ fn main() -> ExitCode {
             app_id,
             &candidates,
             version,
-            cli.json,
+            format,
             &mut out,
             &mut err,
         ),
-        Command::Signal { app_id } => signal(&discovery, app_id, cli.json, &mut out, &mut err),
+        Command::Signal { app_id } => signal(&discovery, app_id, format, &mut out, &mut err),
     };
-    let delivered = result.and_then(|code| {
+    let delivered = result.and_then(|exit| {
         out.flush()?;
-        Ok(code)
+        Ok(exit)
     });
     // Standard error is the last channel left, so a failure to report on it
     // is dropped; the exit code still says no result was produced.
-    let code = match delivered {
-        Ok(code) => code,
+    let exit = match delivered {
+        Ok(exit) => exit,
         // The reader closed standard output early, as `| head` does. It
         // asked for less than the whole result, so there is nothing to tell.
-        Err(OutputErr::Write(error)) if error.kind() == io::ErrorKind::BrokenPipe => EXIT_FAILED,
+        Err(OutputErr::Write(error)) if error.kind() == io::ErrorKind::BrokenPipe => Exit::Failed,
         Err(OutputErr::Write(error)) => {
             let _ = writeln!(err, "could not write output: {error}");
-            EXIT_FAILED
+            Exit::Failed
         }
         Err(OutputErr::Serialize(error)) => {
             let _ = writeln!(err, "could not serialize the report: {error}");
-            EXIT_FAILED
+            Exit::Failed
         }
     };
-    ExitCode::from(code)
+    ExitCode::from(exit)
 }
 
 fn scan(
     discovery: &Discovery,
-    json: bool,
+    format: OutputFormat,
     out: &mut impl Write,
     err: &mut impl Write,
-) -> Result<u8, OutputErr> {
-    if json {
-        print_json(out, discovery)?;
-    } else {
-        writeln!(out, "state: {}", describe_state(discovery.state()))?;
-        for root in discovery.inventory().steam_roots() {
-            writeln!(out, "steam root: {root}")?;
-        }
-        for library in discovery.inventory().libraries() {
-            writeln!(out, "library: {library}")?;
-        }
-        for app in discovery.inventory().apps() {
-            writeln!(out, "{}", describe_app(app))?;
-        }
-        writeln!(out, "attempts:")?;
-        for (attempt, diagnostic) in discovery.attempts_with_diagnostics() {
-            let source = describe_source(&attempt.source);
-            let outcome = describe_outcome(attempt.outcome);
-            let mut line = format!("  {source}: {outcome}");
-            if let Some(candidate) = &attempt.candidate {
-                let formatted = write!(line, " ({})", candidate.display());
-                debug_assert!(
-                    formatted.is_ok(),
-                    "formatting a discovery candidate into a String must be infallible"
-                );
+) -> Result<Exit, OutputErr> {
+    match format {
+        OutputFormat::Json => print_json(out, discovery)?,
+        OutputFormat::Human => {
+            writeln!(out, "state: {}", describe_state(discovery.state()))?;
+            for root in discovery.inventory().steam_roots() {
+                writeln!(out, "steam root: {root}")?;
             }
-            if let Some(detail) = attempt.detail.as_deref() {
-                line.push_str(" - ");
-                line.push_str(detail);
-            } else if let Some(diagnostic) = diagnostic {
-                line.push_str(" - ");
-                line.push_str(&diagnostic.message);
+            for library in discovery.inventory().libraries() {
+                writeln!(out, "library: {library}")?;
             }
-            writeln!(out, "{line}")?;
+            for app in discovery.inventory().apps() {
+                writeln!(out, "{}", describe_app(app))?;
+            }
+            writeln!(out, "attempts:")?;
+            for (attempt, diagnostic) in discovery.attempts_with_diagnostics() {
+                let source = describe_source(&attempt.source);
+                let outcome = describe_outcome(attempt.outcome);
+                let mut line = format!("  {source}: {outcome}");
+                if let Some(candidate) = &attempt.candidate {
+                    let formatted = write!(line, " ({})", candidate.display());
+                    debug_assert!(
+                        formatted.is_ok(),
+                        "formatting a discovery candidate into a String must be infallible"
+                    );
+                }
+                if let Some(detail) = attempt.detail() {
+                    line.push_str(" - ");
+                    line.push_str(detail);
+                } else if let Some(diagnostic) = diagnostic {
+                    line.push_str(" - ");
+                    line.push_str(&diagnostic.message);
+                }
+                writeln!(out, "{line}")?;
+            }
+            print_diagnostics(err, discovery.diagnostics())?;
         }
-        print_diagnostics(err, discovery.diagnostics())?;
     }
     let result = match discovery.state() {
-        DiscoveryState::Complete => EXIT_OK,
-        DiscoveryState::NotFound => EXIT_NONE,
-        DiscoveryState::Unsupported => EXIT_UNSUPPORTED,
-        DiscoveryState::Partial | _ => EXIT_PARTIAL,
+        DiscoveryState::Complete => Exit::Success,
+        DiscoveryState::NotFound => Exit::NothingFound,
+        DiscoveryState::Unsupported => Exit::Unsupported,
+        DiscoveryState::Partial | _ => Exit::Partial,
     };
-    Ok(final_code(discovery, result, true))
+    Ok(result.after_discovery(discovery, Evidence::Complete))
 }
 
 fn apps(
     discovery: &Discovery,
     app_id: Option<NonZeroU32>,
-    json: bool,
+    format: OutputFormat,
     out: &mut impl Write,
     err: &mut impl Write,
-) -> Result<u8, OutputErr> {
+) -> Result<Exit, OutputErr> {
     let selected: Vec<&AppInstall> = discovery
         .inventory()
         .apps()
         .iter()
-        .filter(|app| app_id.is_none_or(|wanted| app.app_id() == wanted.get()))
+        .filter(|app| app_id.is_none_or(|wanted| app.app_id() == wanted))
         .collect();
-    if json {
-        print_json(out, &selected)?;
-    } else {
-        for app in &selected {
-            writeln!(out, "{}", describe_app(app))?;
+    match format {
+        OutputFormat::Json => print_json(out, &selected)?,
+        OutputFormat::Human => {
+            for app in &selected {
+                writeln!(out, "{}", describe_app(app))?;
+            }
         }
     }
     // The app list carries no diagnostics of its own; these explain a
     // partial exit code.
     print_diagnostics(err, discovery.diagnostics())?;
     let result = if selected.is_empty() {
-        EXIT_NONE
+        Exit::NothingFound
     } else {
-        EXIT_OK
+        Exit::Success
     };
-    Ok(final_code(discovery, result, true))
+    Ok(result.after_discovery(discovery, Evidence::Complete))
 }
 
 fn resolve(
@@ -236,15 +305,15 @@ fn resolve(
     app_id: NonZeroU32,
     candidates: &[PathBuf],
     version: bool,
-    json: bool,
+    format: OutputFormat,
     out: &mut impl Write,
     err: &mut impl Write,
-) -> Result<u8, OutputErr> {
+) -> Result<Exit, OutputErr> {
     let query = match ExecutableQuery::any_of(app_id.get(), candidates.iter().cloned()) {
         Ok(query) => query,
         Err(error) => {
             writeln!(err, "invalid executable query: {error}")?;
-            return Ok(2);
+            return Ok(Exit::Usage);
         }
     };
     let report = discovery.resolve_executable(&query);
@@ -258,47 +327,52 @@ fn resolve(
         Vec::new()
     };
 
-    if json {
-        print_json(
+    match format {
+        OutputFormat::Json => print_json(
             out,
             &ResolveOutput {
                 report: &report,
                 versions: &versions,
             },
-        )?;
-    } else {
-        for found in report.matches() {
-            writeln!(
-                out,
-                "app {} ({}): {}",
-                found.app().app_id(),
-                found.app().name().unwrap_or("unnamed"),
-                found.executable()
-            )?;
+        )?,
+        OutputFormat::Human => {
+            for found in report.matches() {
+                writeln!(
+                    out,
+                    "app {} ({}): {}",
+                    found.app().app_id(),
+                    found.app().name().unwrap_or("unnamed"),
+                    found.executable()
+                )?;
+            }
+            for entry in &versions {
+                writeln!(out, "{}", entry.describe())?;
+            }
+            print_diagnostics_iter(err, report.diagnostics())?;
         }
-        for entry in &versions {
-            writeln!(out, "{}", entry.describe())?;
-        }
-        print_diagnostics_iter(err, report.diagnostics())?;
     }
     let result = match report.cardinality() {
-        MatchCardinality::One => EXIT_OK,
-        MatchCardinality::None => EXIT_NONE,
-        MatchCardinality::Many | _ => EXIT_AMBIGUOUS,
+        MatchCardinality::One => Exit::Success,
+        MatchCardinality::None => Exit::NothingFound,
+        MatchCardinality::Many | _ => Exit::Ambiguous,
     };
-    let evidence_complete = report.completeness() == MatchCompleteness::Complete
-        && versions.iter().all(VersionOutput::is_complete);
-    Ok(final_code(discovery, result, evidence_complete))
+    let evidence = if report.completeness() == MatchCompleteness::Complete
+        && versions.iter().all(VersionOutput::is_readable)
+    {
+        Evidence::Complete
+    } else {
+        Evidence::Partial
+    };
+    Ok(result.after_discovery(discovery, evidence))
 }
 
 fn signal(
     discovery: &Discovery,
     app_id: NonZeroU32,
-    json: bool,
+    format: OutputFormat,
     out: &mut impl Write,
     err: &mut impl Write,
-) -> Result<u8, OutputErr> {
-    let app_id = app_id.get();
+) -> Result<Exit, OutputErr> {
     // The signal carries no diagnostics of its own; these explain a missing
     // app or a partial exit code.
     print_diagnostics(err, discovery.diagnostics())?;
@@ -307,7 +381,7 @@ fn signal(
         [app] => app,
         [] => {
             writeln!(err, "app {app_id} is not present in the loaded inventory")?;
-            return Ok(final_code(discovery, EXIT_NONE, true));
+            return Ok(Exit::NothingFound.after_discovery(discovery, Evidence::Complete));
         }
         many => {
             writeln!(
@@ -315,28 +389,27 @@ fn signal(
                 "app {app_id} has {} installations; a signal needs exactly one",
                 many.len()
             )?;
-            return Ok(final_code(discovery, EXIT_AMBIGUOUS, true));
+            return Ok(Exit::Ambiguous.after_discovery(discovery, Evidence::Complete));
         }
     };
     match app.content_signal() {
         Ok(signal) => {
-            if json {
-                print_json(
+            match format {
+                OutputFormat::Json => print_json(
                     out,
                     &serde_json::json!({
                         "app_id": app_id,
                         "scheme": signal.scheme(),
                         "value": signal.value(),
                     }),
-                )?;
-            } else {
-                writeln!(out, "{} {}", signal.scheme(), signal.value())?;
+                )?,
+                OutputFormat::Human => writeln!(out, "{} {}", signal.scheme(), signal.value())?,
             }
-            Ok(final_code(discovery, EXIT_OK, true))
+            Ok(Exit::Success.after_discovery(discovery, Evidence::Complete))
         }
         Err(error) => {
             writeln!(err, "could not derive a content signal: {error}")?;
-            Ok(EXIT_FAILED)
+            Ok(Exit::Failed)
         }
     }
 }
@@ -348,35 +421,51 @@ struct ResolveOutput<'a> {
     versions: &'a [VersionOutput],
 }
 
+/// One match's version-resource read, serialized as `executable` plus
+/// either `version` or `error`.
 #[derive(serde::Serialize)]
-struct VersionOutput {
-    executable: PathBuf,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    version: Option<FileVersion>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+#[serde(untagged)]
+enum VersionOutput {
+    Found {
+        executable: PathBuf,
+        version: FileVersion,
+    },
+    Absent {
+        executable: PathBuf,
+    },
+    Unreadable {
+        executable: PathBuf,
+        error: String,
+    },
 }
 
 impl VersionOutput {
     fn read(executable: &ExecutablePath) -> Self {
-        let (version, error) = match executable.version() {
-            Ok(version) => (version, None),
-            Err(error) => (None, Some(error.to_string())),
-        };
-        Self {
-            executable: executable.path().to_path_buf(),
-            version,
-            error,
+        let path = executable.path().to_path_buf();
+        match executable.version() {
+            Ok(Some(version)) => Self::Found {
+                executable: path,
+                version,
+            },
+            Ok(None) => Self::Absent { executable: path },
+            Err(error) => Self::Unreadable {
+                executable: path,
+                error: error.to_string(),
+            },
         }
     }
 
     fn describe(&self) -> String {
-        let name = self.executable.display();
-        if let Some(error) = &self.error {
-            return format!("{name}: version unreadable - {error}");
-        }
-        let Some(version) = &self.version else {
-            return format!("{name}: no version resource");
+        let (name, version) = match self {
+            Self::Found {
+                executable,
+                version,
+            } => (executable.display(), version),
+            Self::Absent { executable } => {
+                return format!("{}: no version resource", executable.display());
+            }
+            // The error message already starts with the executable path.
+            Self::Unreadable { error, .. } => return error.clone(),
         };
         let mut parts = Vec::new();
         if let Some(product) = &version.product_version {
@@ -395,8 +484,11 @@ impl VersionOutput {
         format!("{name}: {}", parts.join(", "))
     }
 
-    const fn is_complete(&self) -> bool {
-        self.error.is_none()
+    const fn is_readable(&self) -> bool {
+        match self {
+            Self::Found { .. } | Self::Absent { .. } => true,
+            Self::Unreadable { .. } => false,
+        }
     }
 }
 
@@ -474,9 +566,12 @@ fn describe_source(source: &DiscoverySource) -> String {
     match source {
         DiscoverySource::Explicit => "explicit root".to_string(),
         DiscoverySource::Registry {
-            hive, key, value, ..
+            hive,
+            key,
+            value,
+            view,
         } => {
-            format!("registry {hive}\\{key}\\{value}")
+            format!("registry {hive}\\{key}\\{value} ({view} view)")
         }
         DiscoverySource::Process { executable } => format!("running {executable}"),
         DiscoverySource::Environment { variable } => format!("environment {variable}"),
@@ -504,30 +599,6 @@ fn print_diagnostics_iter<'a>(
     Ok(())
 }
 
-fn final_code(discovery: &Discovery, result: u8, evidence_complete: bool) -> u8 {
-    final_code_for(
-        discovery.state(),
-        discovery.has_errors(),
-        result,
-        evidence_complete,
-    )
-}
-
-const fn final_code_for(
-    state: DiscoveryState,
-    has_errors: bool,
-    result: u8,
-    evidence_complete: bool,
-) -> u8 {
-    if matches!(state, DiscoveryState::Unsupported) {
-        EXIT_UNSUPPORTED
-    } else if !evidence_complete || has_errors {
-        EXIT_PARTIAL
-    } else {
-        result
-    }
-}
-
 fn print_json(out: &mut impl Write, value: &impl serde::Serialize) -> Result<(), OutputErr> {
     let text = serde_json::to_string_pretty(value).map_err(OutputErr::Serialize)?;
     writeln!(out, "{text}")?;
@@ -541,20 +612,20 @@ mod tests {
     #[test]
     fn unsupported_state_has_highest_exit_precedence() {
         assert_eq!(
-            final_code_for(DiscoveryState::Unsupported, true, EXIT_NONE, false),
-            EXIT_UNSUPPORTED
+            Exit::NothingFound.after_evidence(DiscoveryState::Unsupported, Evidence::Partial),
+            Exit::Unsupported
         );
     }
 
     #[test]
     fn incomplete_evidence_precedes_a_subcommand_result() {
         assert_eq!(
-            final_code_for(DiscoveryState::Complete, false, EXIT_OK, false),
-            EXIT_PARTIAL
+            Exit::Success.after_evidence(DiscoveryState::Complete, Evidence::Partial),
+            Exit::Partial
         );
         assert_eq!(
-            final_code_for(DiscoveryState::Complete, true, EXIT_NONE, true),
-            EXIT_PARTIAL
+            Exit::NothingFound.after_evidence(DiscoveryState::Complete, Evidence::Partial),
+            Exit::Partial
         );
     }
 }

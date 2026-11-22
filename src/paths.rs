@@ -1,3 +1,6 @@
+//! steamapps-scan - Validated paths
+//! =================================
+//!
 //! Validated filesystem path roles used by discovery and executable queries.
 
 use std::{

@@ -1,3 +1,6 @@
+//! steamapps-scan - Executable queries
+//! ====================================
+//!
 //! Executable target queries evaluated against a loaded Steam inventory.
 
 use std::{
@@ -45,11 +48,14 @@ pub enum QueryErr {
 ///
 /// Candidates are exact paths relative to the app installation and are tried
 /// in order for each matching installation.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ExecutableQuery {
     app_id: NonZeroU32,
-    candidates: Vec<RelativeExecutablePath>,
+    /// Most preferred candidate; a query always has at least this one.
+    primary: RelativeExecutablePath,
+    /// Lower-priority candidates in preference order.
+    fallbacks: Vec<RelativeExecutablePath>,
 }
 
 impl ExecutableQuery {
@@ -65,38 +71,66 @@ impl ExecutableQuery {
         P: Into<PathBuf>,
     {
         let app_id = NonZeroU32::new(app_id).ok_or(QueryErr::InvalidAppId)?;
-        let candidates = candidates
-            .into_iter()
-            .map(|candidate| RelativeExecutablePath::validate(candidate.into()))
-            .collect::<Result<Vec<_>, _>>()?;
-        if candidates.is_empty() {
-            return Err(QueryErr::NoCandidates);
-        }
-        Ok(Self { app_id, candidates })
+        Self::for_app(app_id, candidates)
     }
 
     /// Append a lower-priority candidate.
     pub fn fallback(mut self, candidate: impl Into<PathBuf>) -> Result<Self, QueryErr> {
-        self.candidates
+        self.fallbacks
             .push(RelativeExecutablePath::validate(candidate.into())?);
         Ok(self)
     }
 
     /// Steam app ID evaluated by this query.
     #[must_use]
-    pub const fn app_id(&self) -> u32 {
-        self.app_id.get()
+    pub const fn app_id(&self) -> NonZeroU32 {
+        self.app_id
     }
 
     /// Validated candidates in preference order.
-    #[must_use]
-    pub fn candidates(&self) -> &[RelativeExecutablePath] {
-        &self.candidates
+    pub fn candidates(&self) -> impl Iterator<Item = &RelativeExecutablePath> {
+        std::iter::once(&self.primary).chain(&self.fallbacks)
     }
 
     /// Build a runtime query from a consumer-defined marker type.
     pub fn for_target<T: ExecutableTarget>() -> Result<Self, QueryErr> {
-        Self::any_of(T::APP_ID, T::EXECUTABLES.iter().copied())
+        Self::for_app(T::APP_ID, T::EXECUTABLES.iter().copied())
+    }
+
+    fn for_app<I, P>(app_id: NonZeroU32, candidates: I) -> Result<Self, QueryErr>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        let mut candidates = candidates
+            .into_iter()
+            .map(|candidate| RelativeExecutablePath::validate(candidate.into()));
+        let Some(primary) = candidates.next() else {
+            return Err(QueryErr::NoCandidates);
+        };
+        Ok(Self {
+            app_id,
+            primary: primary?,
+            fallbacks: candidates.collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+impl serde::Serialize for ExecutableQuery {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(serde::Serialize)]
+        struct SerializableExecutableQuery<'a> {
+            app_id: NonZeroU32,
+            candidates: Vec<&'a RelativeExecutablePath>,
+        }
+
+        serde::Serialize::serialize(
+            &SerializableExecutableQuery {
+                app_id: self.app_id,
+                candidates: self.candidates().collect(),
+            },
+            serializer,
+        )
     }
 }
 
@@ -106,7 +140,7 @@ impl ExecutableQuery {
 /// provide different [`Self::EXECUTABLES`].
 pub trait ExecutableTarget {
     /// Steam app ID containing the target executable.
-    const APP_ID: u32;
+    const APP_ID: NonZeroU32;
     /// Exact installation-relative paths in preference order.
     const EXECUTABLES: &'static [&'static str];
 }
@@ -192,6 +226,26 @@ pub enum MatchCompleteness {
     Partial,
 }
 
+/// Failure to reduce a query report to exactly one match.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, thiserror::Error)]
+#[non_exhaustive]
+pub enum MatchErr {
+    /// A report contained no matches.
+    #[error("no executable matched app {app_id}")]
+    NotFound {
+        /// Steam app ID requested by the query.
+        app_id: NonZeroU32,
+    },
+    /// A report contained more than one match.
+    #[error("{matches} executables matched app {app_id}")]
+    Ambiguous {
+        /// Steam app ID requested by the query.
+        app_id: NonZeroU32,
+        /// Number of matches retained by the report.
+        matches: usize,
+    },
+}
+
 /// Non-lossy result of one executable query.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -224,9 +278,9 @@ impl MatchReport {
             query.app_id()
         );
         debug_assert!(
-            matches
-                .iter()
-                .all(|matched| query.candidates().contains(matched.matched_candidate())),
+            matches.iter().all(|matched| query
+                .candidates()
+                .any(|candidate| candidate == matched.matched_candidate())),
             "every executable match must retain one of the query's validated candidates"
         );
         debug_assert!(
@@ -349,26 +403,6 @@ impl serde::Serialize for MatchReport {
     }
 }
 
-/// Failure to reduce a query report to exactly one match.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, thiserror::Error)]
-#[non_exhaustive]
-pub enum MatchErr {
-    /// A report contained no matches.
-    #[error("no executable matched app {app_id}")]
-    NotFound {
-        /// Steam app ID requested by the query.
-        app_id: u32,
-    },
-    /// A report contained more than one match.
-    #[error("{matches} executables matched app {app_id}")]
-    Ambiguous {
-        /// Steam app ID requested by the query.
-        app_id: u32,
-        /// Number of matches retained by the report.
-        matches: usize,
-    },
-}
-
 impl SteamInventory {
     /// Resolve a query against every installation with the requested app ID.
     ///
@@ -423,8 +457,7 @@ impl SteamInventory {
                 AppResolution::NotFound(mut app_diagnostics) => {
                     query_diagnostics.append(&mut app_diagnostics);
                     let candidates = query
-                        .candidates
-                        .iter()
+                        .candidates()
                         .map(|candidate| candidate.path().display().to_string())
                         .collect::<Vec<_>>()
                         .join(", ");
@@ -483,7 +516,7 @@ enum AppResolution {
 impl AppInstall {
     fn resolve_executable(&self, query: &ExecutableQuery) -> AppResolution {
         let mut diagnostics = Vec::new();
-        for candidate in &query.candidates {
+        for candidate in query.candidates() {
             let path = self.path().join(candidate.path());
             let executable = match FilePresence::of(&path) {
                 FilePresence::Missing => continue,

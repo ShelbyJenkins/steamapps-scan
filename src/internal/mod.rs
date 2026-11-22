@@ -1,3 +1,6 @@
+//! steamapps-scan - Internal backend
+//! ==================================
+//!
 //! Backend implementation the public API drives: root providers and the
 //! scan pipeline. Nothing here is exported; callers interact only with the
 //! types re-exported from the crate root.

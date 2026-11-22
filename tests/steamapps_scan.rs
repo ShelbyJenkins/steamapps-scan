@@ -6,6 +6,7 @@
 )]
 
 use std::{
+    num::{NonZeroU32, NonZeroU64},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU32, Ordering},
 };
@@ -17,6 +18,10 @@ use steamapps_scan::{
     DiscoveryState, ExecutableQuery, ExecutableTarget, MAX_STEAM_METADATA_BYTES, MatchCardinality,
     MatchCompleteness, MatchErr, QueryErr, StateFlags,
 };
+
+const fn fixture_app_id(raw: u32) -> NonZeroU32 {
+    NonZeroU32::new(raw).expect("fixture app ID is nonzero")
+}
 
 struct TempTree(PathBuf);
 
@@ -100,7 +105,7 @@ fn discovers_an_arbitrary_app_without_libraryfolders() {
     assert_eq!(discovery.inventory().libraries().len(), 1);
     let app = discovery
         .inventory()
-        .apps_for(APP_ID)
+        .apps_for(fixture_app_id(APP_ID))
         .next()
         .expect("arbitrary app should be inventoried");
     assert_eq!(app.path(), dunce::canonicalize(install).unwrap());
@@ -194,20 +199,20 @@ fn marker_targets_can_share_an_app_id() {
 
     struct Game;
     impl ExecutableTarget for Game {
-        const APP_ID: u32 = SHARED_APP_ID;
+        const APP_ID: NonZeroU32 = NonZeroU32::new(SHARED_APP_ID).unwrap();
         const EXECUTABLES: &'static [&'static str] = &["game.exe"];
     }
 
     struct Server;
     impl ExecutableTarget for Server {
-        const APP_ID: u32 = SHARED_APP_ID;
+        const APP_ID: NonZeroU32 = NonZeroU32::new(SHARED_APP_ID).unwrap();
         const EXECUTABLES: &'static [&'static str] = &["server.exe"];
     }
 
     let game = ExecutableQuery::for_target::<Game>().unwrap();
     let server = ExecutableQuery::for_target::<Server>().unwrap();
     assert_eq!(game.app_id(), server.app_id());
-    assert_ne!(game.candidates(), server.candidates());
+    assert!(!game.candidates().eq(server.candidates()));
 }
 
 #[test]
@@ -229,7 +234,7 @@ fn duplicate_app_installs_are_reported_as_ambiguous() {
     assert_eq!(
         report.unique(),
         Err(MatchErr::Ambiguous {
-            app_id: APP_ID,
+            app_id: fixture_app_id(APP_ID),
             matches: 2,
         })
     );
@@ -274,7 +279,7 @@ fn malformed_sibling_manifest_yields_partial_inventory_without_hiding_matches() 
     assert!(report.diagnostics().any(|diagnostic| {
         diagnostic.stage == DiscoveryStage::ReadManifest
             && diagnostic.kind == DiagnosticKind::Parse
-            && diagnostic.app_id == Some(21)
+            && diagnostic.app_id == Some(fixture_app_id(21))
     }));
 }
 
@@ -347,7 +352,7 @@ fn reserved_zero_manifest_app_id_is_rejected() {
     assert_eq!(discovery.state(), DiscoveryState::Partial);
     assert!(discovery.inventory().apps().is_empty());
     assert!(discovery.diagnostics().iter().any(|diagnostic| {
-        diagnostic.app_id == Some(0)
+        diagnostic.app_id.is_none()
             && diagnostic.kind == DiagnosticKind::InvalidData
             && diagnostic.message.contains("reserved invalid app ID 0")
     }));
@@ -435,7 +440,13 @@ fn libraryfolders_expands_all_libraries_and_deduplicates_slots() {
 
     assert_eq!(discovery.state(), DiscoveryState::Complete);
     assert_eq!(discovery.inventory().libraries().len(), 2);
-    assert_eq!(discovery.inventory().apps_for(APP_ID).count(), 1);
+    assert_eq!(
+        discovery
+            .inventory()
+            .apps_for(fixture_app_id(APP_ID))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -452,7 +463,13 @@ fn relative_library_paths_are_not_resolved_against_the_process_directory() {
 
     assert_eq!(discovery.state(), DiscoveryState::Partial);
     assert_eq!(discovery.inventory().libraries().len(), 1);
-    assert_eq!(discovery.inventory().apps_for(APP_ID).count(), 1);
+    assert_eq!(
+        discovery
+            .inventory()
+            .apps_for(fixture_app_id(APP_ID))
+            .count(),
+        1
+    );
     assert!(discovery.diagnostics().iter().any(|diagnostic| {
         diagnostic.stage == DiscoveryStage::ValidateLibrary
             && diagnostic.kind == DiagnosticKind::InvalidData
@@ -477,7 +494,13 @@ fn malformed_library_slot_does_not_hide_a_valid_sibling() {
     let discovery = steam.discover();
 
     assert_eq!(discovery.state(), DiscoveryState::Partial);
-    assert_eq!(discovery.inventory().apps_for(APP_ID).count(), 1);
+    assert_eq!(
+        discovery
+            .inventory()
+            .apps_for(fixture_app_id(APP_ID))
+            .count(),
+        1
+    );
     assert!(discovery.diagnostics().iter().any(|diagnostic| {
         diagnostic.stage == DiscoveryStage::ReadLibraryFolders
             && diagnostic.message.contains("slot '0' has no path")
@@ -524,12 +547,19 @@ fn metadata_size_and_utf8_failures_are_reported_without_hiding_valid_apps() {
     let discovery = steam.discover();
 
     assert_eq!(discovery.state(), DiscoveryState::Partial);
-    assert_eq!(discovery.inventory().apps_for(APP_ID).count(), 1);
+    assert_eq!(
+        discovery
+            .inventory()
+            .apps_for(fixture_app_id(APP_ID))
+            .count(),
+        1
+    );
     assert!(discovery.diagnostics().iter().any(|diagnostic| {
-        diagnostic.app_id == Some(81) && diagnostic.message.contains("exceeds the")
+        diagnostic.app_id == Some(fixture_app_id(81)) && diagnostic.message.contains("exceeds the")
     }));
     assert!(discovery.diagnostics().iter().any(|diagnostic| {
-        diagnostic.app_id == Some(82) && diagnostic.message.contains("not valid UTF-8")
+        diagnostic.app_id == Some(fixture_app_id(82))
+            && diagnostic.message.contains("not valid UTF-8")
     }));
 }
 
@@ -575,7 +605,7 @@ fn manifest_metadata_is_parsed_leniently_and_serialized_sparsely() {
     assert!(discovery.diagnostics().is_empty());
     let app = discovery
         .inventory()
-        .apps_for(APP_ID)
+        .apps_for(fixture_app_id(APP_ID))
         .next()
         .expect("app with metadata should be inventoried");
 
@@ -584,15 +614,21 @@ fn manifest_metadata_is_parsed_leniently_and_serialized_sparsely() {
     assert_eq!(flags.raw(), 6);
     assert!(flags.is_fully_installed());
     assert!(flags.update_required());
-    assert_eq!(app.metadata().build_id, Some(24_548_213));
+    assert_eq!(
+        app.metadata().build_id.map(NonZeroU64::get),
+        Some(24_548_213)
+    );
     assert_eq!(app.metadata().size_on_disk, None);
     assert_eq!(app.metadata().last_updated, Some(1_723_756_800));
     assert_eq!(app.metadata().beta_key.as_deref(), Some("profiling"));
     assert_eq!(app.metadata().installed_depots.len(), 1);
-    let depot = &app.metadata().installed_depots[&1_874_911];
-    assert_eq!(depot.manifest, Some(6_518_622_583_388_653_769));
+    let depot = &app.metadata().installed_depots[&NonZeroU64::new(1_874_911).unwrap()];
+    assert_eq!(
+        depot.manifest.map(NonZeroU64::get),
+        Some(6_518_622_583_388_653_769)
+    );
     assert_eq!(depot.size, Some(123_456));
-    assert_eq!(depot.dlc_app_id, Some(1_874_910));
+    assert_eq!(depot.dlc_app_id, Some(fixture_app_id(1_874_910)));
 
     let json = serde_json::to_value(&discovery).expect("serialize report");
     let metadata = &json["inventory"]["apps"][0]["metadata"];
@@ -632,7 +668,7 @@ fn ambiguous_numeric_depot_metadata_is_omitted_with_a_warning() {
     assert!(!discovery.has_errors());
     let app = discovery
         .inventory()
-        .apps_for(APP_ID)
+        .apps_for(fixture_app_id(APP_ID))
         .next()
         .expect("the valid app identity must remain inventoried");
     assert!(app.metadata().installed_depots.is_empty());
@@ -673,7 +709,7 @@ fn unreadable_optional_metadata_keeps_the_app_with_a_warning() {
     assert!(!discovery.has_errors());
     let app = discovery
         .inventory()
-        .apps_for(APP_ID)
+        .apps_for(fixture_app_id(APP_ID))
         .next()
         .expect("unreadable optional metadata must not evict the app");
     assert_eq!(app.metadata(), &AppMetadata::default());
@@ -681,7 +717,7 @@ fn unreadable_optional_metadata_keeps_the_app_with_a_warning() {
     let warning = discovery
         .diagnostics()
         .iter()
-        .find(|diagnostic| diagnostic.app_id == Some(APP_ID))
+        .find(|diagnostic| diagnostic.app_id == Some(fixture_app_id(APP_ID)))
         .expect("skipped metadata leaves a diagnostic");
     assert_eq!(warning.severity, DiagnosticSeverity::Warning);
     assert_eq!(warning.stage, DiscoveryStage::ReadManifest);
@@ -712,7 +748,7 @@ fn explicit_root_attempts_and_failures_are_retained() {
     assert_eq!(discovery.attempts()[0].outcome, AttemptOutcome::Rejected);
     assert_eq!(discovery.attempts()[1].outcome, AttemptOutcome::Accepted);
     assert_eq!(discovery.attempts()[2].outcome, AttemptOutcome::Duplicate);
-    assert!(discovery.attempts()[0].detail.is_none());
+    assert!(discovery.attempts()[0].detail().is_none());
     let (_, linked_diagnostic) = discovery
         .attempts_with_diagnostics()
         .next()

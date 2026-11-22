@@ -1,8 +1,11 @@
+//! steamapps-scan - Discovery report
+//! ==================================
+//!
 //! Public inventory, discovery state, attempt ledger, and diagnostics.
 
 use std::{
     collections::BTreeMap,
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroU64},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -57,8 +60,8 @@ impl AppInstall {
 
     /// Nonzero Steam application ID cross-checked with the manifest file name.
     #[must_use]
-    pub const fn app_id(&self) -> u32 {
-        self.app_id.get()
+    pub const fn app_id(&self) -> NonZeroU32 {
+        self.app_id
     }
 
     /// Optional display name from the manifest.
@@ -120,7 +123,7 @@ pub struct AppMetadata {
     pub state_flags: Option<StateFlags>,
     /// Build currently installed, as Steam recorded it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub build_id: Option<u64>,
+    pub build_id: Option<NonZeroU64>,
     /// Steam's accounting of the installation size in bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_on_disk: Option<u64>,
@@ -132,7 +135,7 @@ pub struct AppMetadata {
     pub beta_key: Option<String>,
     /// Installed depots keyed by depot ID.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub installed_depots: BTreeMap<u64, InstalledDepot>,
+    pub installed_depots: BTreeMap<NonZeroU64, InstalledDepot>,
 }
 
 /// One installed depot from a manifest's `InstalledDepots` block.
@@ -141,13 +144,13 @@ pub struct AppMetadata {
 pub struct InstalledDepot {
     /// Depot manifest ID pinning the exact content revision.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub manifest: Option<u64>,
+    pub manifest: Option<NonZeroU64>,
     /// Depot size in bytes as Steam recorded it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
     /// Owning DLC app when the depot belongs to one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dlc_app_id: Option<u32>,
+    pub dlc_app_id: Option<NonZeroU32>,
 }
 
 /// The manifest `StateFlags` bitmask, kept raw with named predicates for
@@ -221,7 +224,7 @@ impl SteamInventory {
     }
 
     /// Iterate over every installation matching an app ID.
-    pub fn apps_for(&self, app_id: u32) -> impl Iterator<Item = &AppInstall> {
+    pub fn apps_for(&self, app_id: NonZeroU32) -> impl Iterator<Item = &AppInstall> {
         self.apps.iter().filter(move |app| app.app_id() == app_id)
     }
 }
@@ -348,23 +351,43 @@ pub struct DiscoveryAttempt {
     pub candidate: Option<PathBuf>,
     /// Final disposition of the attempt.
     pub outcome: AttemptOutcome,
-    /// Provider or validation detail, when useful.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-    /// Index of the corresponding entry in [`Discovery::diagnostics`].
-    ///
-    /// This is present when the diagnostic owns the failure detail, avoiding a
-    /// second copy of the same message in this attempt.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) diagnostic_index: Option<usize>,
+    /// Where the attempt's explanation lives, when it needs one.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<AttemptEvidence>,
 }
 
 impl DiscoveryAttempt {
     /// Index of this attempt's diagnostic in [`Discovery::diagnostics`].
     #[must_use]
     pub const fn diagnostic_index(&self) -> Option<usize> {
-        self.diagnostic_index
+        match self.evidence {
+            Some(AttemptEvidence::DiagnosticIndex(index)) => Some(index),
+            Some(AttemptEvidence::Detail(_)) | None => None,
+        }
     }
+
+    /// Provider or validation detail kept on the attempt itself.
+    #[must_use]
+    pub fn detail(&self) -> Option<&str> {
+        match &self.evidence {
+            Some(AttemptEvidence::Detail(detail)) => Some(detail),
+            Some(AttemptEvidence::DiagnosticIndex(_)) | None => None,
+        }
+    }
+}
+
+/// The explanation for one discovery attempt, held in exactly one place.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AttemptEvidence {
+    /// Provider or validation detail, when useful.
+    Detail(String),
+    /// Index of the corresponding entry in [`Discovery::diagnostics`].
+    ///
+    /// This is present when the diagnostic owns the failure detail, avoiding a
+    /// second copy of the same message in this attempt.
+    DiagnosticIndex(usize),
 }
 
 /// Outcome of a root discovery attempt.
@@ -386,9 +409,85 @@ pub enum AttemptOutcome {
     Unsupported,
 }
 
+/// Failure to read one bounded Steam metadata file: `libraryfolders.vdf` or
+/// an app manifest.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum MetadataReadErr {
+    /// The file's metadata could not be inspected.
+    #[error("{}: could not inspect metadata file: {source}", path.display())]
+    Inspect {
+        /// Metadata file path.
+        path: PathBuf,
+        /// Filesystem failure.
+        source: std::io::Error,
+    },
+    /// The path is not a regular file.
+    #[error("{}: metadata path is not a regular file", path.display())]
+    NotFile {
+        /// Metadata file path.
+        path: PathBuf,
+    },
+    /// The file exceeds [`crate::MAX_STEAM_METADATA_BYTES`], or grew past it
+    /// while being read.
+    #[error(
+        "{}: metadata exceeds the {}-byte limit",
+        path.display(),
+        crate::MAX_STEAM_METADATA_BYTES
+    )]
+    TooLarge {
+        /// Metadata file path.
+        path: PathBuf,
+    },
+    /// The file could not be opened.
+    #[error("{}: could not open metadata file: {source}", path.display())]
+    Open {
+        /// Metadata file path.
+        path: PathBuf,
+        /// Filesystem failure.
+        source: std::io::Error,
+    },
+    /// The file could not be read.
+    #[error("{}: could not read metadata file: {source}", path.display())]
+    Read {
+        /// Metadata file path.
+        path: PathBuf,
+        /// Filesystem failure.
+        source: std::io::Error,
+    },
+    /// The file is not valid UTF-8.
+    #[error("{}: metadata is not valid UTF-8: {source}", path.display())]
+    NotUtf8 {
+        /// Metadata file path.
+        path: PathBuf,
+        /// Position of the first invalid byte sequence.
+        source: std::str::Utf8Error,
+    },
+}
+
+impl MetadataReadErr {
+    /// Record this failure as an error diagnostic from `stage`.
+    pub(crate) fn into_diagnostic(
+        self,
+        stage: DiscoveryStage,
+        app_id: Option<NonZeroU32>,
+    ) -> Diagnostic {
+        let (kind, path) = match &self {
+            Self::Inspect { path, .. } | Self::Open { path, .. } | Self::Read { path, .. } => {
+                (DiagnosticKind::Io, path.clone())
+            }
+            Self::NotFile { path } | Self::TooLarge { path } | Self::NotUtf8 { path, .. } => {
+                (DiagnosticKind::InvalidData, path.clone())
+            }
+        };
+        Diagnostic::error(stage, kind, self.to_string())
+            .with_path(path)
+            .with_app_id(app_id)
+    }
+}
+
 /// A retained warning or error from any discovery or query sibling.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, thiserror::Error)]
-#[error("{message}")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 #[non_exhaustive]
 pub struct Diagnostic {
     /// Whether the diagnostic makes the result incomplete.
@@ -406,7 +505,7 @@ pub struct Diagnostic {
     pub path: Option<PathBuf>,
     /// Relevant Steam app ID, when applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub app_id: Option<u32>,
+    pub app_id: Option<NonZeroU32>,
     /// Human-readable diagnostic detail.
     pub message: String,
 }
@@ -460,7 +559,7 @@ impl Diagnostic {
 
     /// Attach the relevant Steam app ID, when one is known.
     #[must_use]
-    pub fn with_app_id(mut self, app_id: impl Into<Option<u32>>) -> Self {
+    pub fn with_app_id(mut self, app_id: impl Into<Option<NonZeroU32>>) -> Self {
         self.app_id = app_id.into();
         self
     }
@@ -492,43 +591,37 @@ impl Discovery {
         #[cfg(debug_assertions)]
         {
             for (attempt_index, attempt) in attempts.iter().enumerate() {
-                if let Some(diagnostic_index) = attempt.diagnostic_index {
-                    let diagnostic = diagnostics.get(diagnostic_index);
-                    debug_assert!(
-                        diagnostic.is_some(),
-                        "attempt {attempt_index} links diagnostic {diagnostic_index}, but only \
-                         {} diagnostics were retained",
-                        diagnostics.len()
-                    );
-                    if let Some(diagnostic) = diagnostic {
-                        debug_assert!(
-                            matches!(
-                                attempt.outcome,
-                                AttemptOutcome::Rejected
-                                    | AttemptOutcome::Failed
-                                    | AttemptOutcome::Unsupported
-                            ),
-                            "attempt {attempt_index} links a diagnostic despite outcome {:?}",
-                            attempt.outcome
-                        );
-                        debug_assert!(
-                            attempt.detail.is_none(),
-                            "attempt {attempt_index} must not duplicate linked diagnostic detail"
-                        );
-                        debug_assert_eq!(
-                            diagnostic.provenance.as_ref(),
-                            Some(&attempt.source),
-                            "attempt {attempt_index} must link a diagnostic from the same source"
-                        );
-                    }
-                } else if matches!(
+                let failed = matches!(
                     attempt.outcome,
                     AttemptOutcome::Rejected | AttemptOutcome::Failed | AttemptOutcome::Unsupported
-                ) {
-                    debug_assert!(
-                        attempt.detail.is_some(),
-                        "unlinked failed attempt {attempt_index} must retain local detail"
-                    );
+                );
+                match &attempt.evidence {
+                    Some(AttemptEvidence::DiagnosticIndex(diagnostic_index)) => {
+                        let diagnostic = diagnostics.get(*diagnostic_index);
+                        debug_assert!(
+                            diagnostic.is_some(),
+                            "attempt {attempt_index} links diagnostic {diagnostic_index}, but only \
+                             {} diagnostics were retained",
+                            diagnostics.len()
+                        );
+                        if let Some(diagnostic) = diagnostic {
+                            debug_assert!(
+                                failed,
+                                "attempt {attempt_index} links a diagnostic despite outcome {:?}",
+                                attempt.outcome
+                            );
+                            debug_assert_eq!(
+                                diagnostic.provenance.as_ref(),
+                                Some(&attempt.source),
+                                "attempt {attempt_index} must link a diagnostic from the same source"
+                            );
+                        }
+                    }
+                    Some(AttemptEvidence::Detail(_)) => {}
+                    None => debug_assert!(
+                        !failed,
+                        "failed attempt {attempt_index} must retain local detail or link a diagnostic"
+                    ),
                 }
             }
         }
@@ -599,7 +692,7 @@ impl Discovery {
     ) -> impl Iterator<Item = (&DiscoveryAttempt, Option<&Diagnostic>)> {
         self.attempts.iter().map(|attempt| {
             let diagnostic = attempt
-                .diagnostic_index
+                .diagnostic_index()
                 .and_then(|index| self.diagnostics.get(index));
             (attempt, diagnostic)
         })

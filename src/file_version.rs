@@ -6,7 +6,7 @@
 //! file on disk without running it.
 //!
 //! The resource is a Windows convention rather than anything app-specific,
-//! and it is optional — plenty of shipped executables carry none.
+//! and it is optional: plenty of shipped executables carry none.
 //!
 //! Two independent version records live in the resource and they routinely
 //! disagree:
@@ -23,6 +23,30 @@
 //! assume it parses as a dotted number.
 
 use std::path::Path;
+
+/// Failure to read an executable's version resource.
+///
+/// An executable with no version resource is not an error: reading reports
+/// `Ok(None)`.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("{}: could not read the version resource: {message}", path.display())]
+#[non_exhaustive]
+pub struct VersionErr {
+    /// Executable that could not be read.
+    pub path: std::path::PathBuf,
+    /// Failure detail, including the OS error code when there was one.
+    pub message: String,
+}
+
+#[cfg(windows)]
+impl VersionErr {
+    fn new(path: &Path, message: impl Into<String>) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            message: message.into(),
+        }
+    }
+}
 
 /// Version records read from one executable's version resource.
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
@@ -83,30 +107,6 @@ impl FileVersion {
     }
 }
 
-/// Failure to read an executable's version resource.
-///
-/// An executable with no version resource is not an error: reading reports
-/// `Ok(None)`.
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("{}: could not read the version resource: {message}", path.display())]
-#[non_exhaustive]
-pub struct VersionErr {
-    /// Executable that could not be read.
-    pub path: std::path::PathBuf,
-    /// Failure detail, including the OS error code when there was one.
-    pub message: String,
-}
-
-#[cfg(windows)]
-impl VersionErr {
-    fn new(path: &Path, message: impl Into<String>) -> Self {
-        Self {
-            path: path.to_path_buf(),
-            message: message.into(),
-        }
-    }
-}
-
 #[cfg(windows)]
 mod windows {
     use std::{ffi::c_void, os::windows::ffi::OsStrExt, path::Path};
@@ -138,7 +138,7 @@ mod windows {
         fn GetLastError() -> u32;
     }
 
-    /// The resource type or data is absent — the file simply carries no
+    /// The resource type or data is absent; the file simply carries no
     /// version resource.
     const ERROR_RESOURCE_DATA_NOT_FOUND: u32 = 1812;
     const ERROR_RESOURCE_TYPE_NOT_FOUND: u32 = 1813;
@@ -158,7 +158,7 @@ mod windows {
             .collect()
     }
 
-    pub(super) fn read(path: &Path) -> Result<Option<FileVersion>, VersionErr> {
+    pub fn read(path: &Path) -> Result<Option<FileVersion>, VersionErr> {
         let filename = wide_path(path);
         let mut handle = 0u32;
 

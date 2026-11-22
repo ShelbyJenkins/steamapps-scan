@@ -17,19 +17,16 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use super::scan::RejectionRecord;
 #[cfg(not(windows))]
 use super::scan::RootCollector;
 #[cfg(not(windows))]
 use crate::report::DiscoverySource;
 
 #[cfg(target_os = "linux")]
-pub(super) fn automatic_roots(collector: &mut RootCollector) {
-    xdg_data_home_candidate(collector);
-    home_candidates(
-        collector,
-        &[
+impl RootCollector {
+    pub fn automatic_roots(&mut self) {
+        self.xdg_data_home_candidate();
+        self.home_candidates(&[
             ".local/share/Steam",
             ".steam/steam",
             ".steam/root",
@@ -40,242 +37,230 @@ pub(super) fn automatic_roots(collector: &mut RootCollector) {
             "snap/steam/common/.local/share/Steam",
             "snap/steam/common/.steam/steam",
             "snap/steam/common/.steam/root",
-        ],
-    );
+        ]);
+    }
+
+    /// `$XDG_DATA_HOME/Steam`, honored only when the variable holds an absolute
+    /// path: the XDG base directory specification requires relative values to be
+    /// ignored.
+    fn xdg_data_home_candidate(&mut self) {
+        let source = DiscoverySource::Environment {
+            variable: "XDG_DATA_HOME".into(),
+        };
+        match std::env::var_os("XDG_DATA_HOME") {
+            Some(value) if !value.is_empty() => {
+                let base = PathBuf::from(value);
+                if base.is_absolute() {
+                    self.candidate(source, base.join("Steam"));
+                } else {
+                    self.rejected_without_candidate(
+                        source,
+                        "value is relative; the XDG base directory specification requires \
+                         relative values to be ignored",
+                    );
+                }
+            }
+            _ => self.not_present(source, "environment variable is not set"),
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn automatic_roots(collector: &mut RootCollector) {
-    home_candidates(collector, &["Library/Application Support/Steam"]);
+impl RootCollector {
+    pub fn automatic_roots(&mut self) {
+        self.home_candidates(&["Library/Application Support/Steam"]);
+    }
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-pub(super) fn automatic_roots(collector: &mut RootCollector) {
-    collector.unsupported(
-        DiscoverySource::Conventional {
-            description: std::env::consts::OS.to_string(),
-        },
-        "automatic Steam discovery supports Windows, Linux, and macOS; use \
-         Discovery::discover_from on this platform",
-    );
-}
-
-/// `$XDG_DATA_HOME/Steam`, honored only when the variable holds an absolute
-/// path: the XDG base directory specification requires relative values to be
-/// ignored.
-#[cfg(target_os = "linux")]
-fn xdg_data_home_candidate(collector: &mut RootCollector) {
-    let source = DiscoverySource::Environment {
-        variable: "XDG_DATA_HOME".into(),
-    };
-    match std::env::var_os("XDG_DATA_HOME") {
-        Some(value) if !value.is_empty() => {
-            let base = PathBuf::from(value);
-            if base.is_absolute() {
-                collector.candidate(source, base.join("Steam"), RejectionRecord::AttemptDetail);
-            } else {
-                collector.rejected_without_candidate(
-                    source,
-                    "value is relative; the XDG base directory specification requires \
-                     relative values to be ignored",
-                );
-            }
-        }
-        _ => collector.not_present(source, "environment variable is not set"),
-    }
-}
-
-/// Home-relative conventional candidates, recorded per path so the ledger
-/// shows which convention produced each root. An unset `HOME` collapses to
-/// one attempt covering all of them.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn home_candidates(collector: &mut RootCollector, relative_paths: &[&str]) {
-    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
-        collector.not_present(
-            DiscoverySource::Environment {
-                variable: "HOME".into(),
-            },
-            "environment variable is not set",
-        );
-        return;
-    };
-    let home = PathBuf::from(home);
-    for relative in relative_paths {
-        collector.candidate(
+impl RootCollector {
+    pub fn automatic_roots(&mut self) {
+        self.unsupported(
             DiscoverySource::Conventional {
-                description: format!("~/{relative}"),
+                description: std::env::consts::OS.to_string(),
             },
-            home.join(relative),
-            RejectionRecord::AttemptDetail,
+            "automatic Steam discovery supports Windows, Linux, and macOS; use \
+             Discovery::discover_from on this platform",
         );
     }
 }
 
-#[cfg(windows)]
-pub(super) use windows::automatic_roots;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl RootCollector {
+    /// Home-relative conventional candidates, recorded per path so the ledger
+    /// shows which convention produced each root. An unset `HOME` collapses to
+    /// one attempt covering all of them.
+    fn home_candidates(&mut self, relative_paths: &[&str]) {
+        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+            self.not_present(
+                DiscoverySource::Environment {
+                    variable: "HOME".into(),
+                },
+                "environment variable is not set",
+            );
+            return;
+        };
+        let home = PathBuf::from(home);
+        for relative in relative_paths {
+            self.candidate(
+                DiscoverySource::Conventional {
+                    description: format!("~/{relative}"),
+                },
+                home.join(relative),
+            );
+        }
+    }
+}
 
 #[cfg(windows)]
 mod windows {
     use std::{io::ErrorKind, path::PathBuf};
 
-    use super::{
-        super::scan::{RejectionRecord, RootCollector},
-        process,
-    };
+    use super::{super::scan::RootCollector, process};
     use crate::report::DiscoverySource;
 
     const STEAM_IMAGE_NAME: &str = "steam.exe";
 
-    pub fn automatic_roots(collector: &mut RootCollector) {
-        registry_candidates(collector);
-        running_steam_candidates(collector);
-        default_candidates(collector);
-    }
+    impl RootCollector {
+        pub fn automatic_roots(&mut self) {
+            self.registry_candidates();
+            self.running_steam_candidates();
+            self.default_candidates();
+        }
 
-    fn registry_candidates(collector: &mut RootCollector) {
-        use winreg::{
-            RegKey,
-            enums::{
-                HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
-            },
-        };
+        fn registry_candidates(&mut self) {
+            use winreg::{
+                RegKey,
+                enums::{
+                    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY,
+                    KEY_WOW64_64KEY,
+                },
+            };
 
-        let locations = [
-            (
-                HKEY_CURRENT_USER,
-                "HKCU",
-                r"Software\Valve\Steam",
-                "SteamPath",
-                KEY_READ,
-                "default",
-            ),
-            (
-                HKEY_LOCAL_MACHINE,
-                "HKLM",
-                r"SOFTWARE\Valve\Steam",
-                "InstallPath",
-                KEY_READ | KEY_WOW64_32KEY,
-                "32-bit",
-            ),
-            (
-                HKEY_LOCAL_MACHINE,
-                "HKLM",
-                r"SOFTWARE\Valve\Steam",
-                "InstallPath",
-                KEY_READ | KEY_WOW64_64KEY,
-                "64-bit",
-            ),
-        ];
+            let locations = [
+                (
+                    HKEY_CURRENT_USER,
+                    "HKCU",
+                    r"Software\Valve\Steam",
+                    "SteamPath",
+                    KEY_READ,
+                    "default",
+                ),
+                (
+                    HKEY_LOCAL_MACHINE,
+                    "HKLM",
+                    r"SOFTWARE\Valve\Steam",
+                    "InstallPath",
+                    KEY_READ | KEY_WOW64_32KEY,
+                    "32-bit",
+                ),
+                (
+                    HKEY_LOCAL_MACHINE,
+                    "HKLM",
+                    r"SOFTWARE\Valve\Steam",
+                    "InstallPath",
+                    KEY_READ | KEY_WOW64_64KEY,
+                    "64-bit",
+                ),
+            ];
 
-        for (hive, hive_name, key_name, value_name, flags, view) in locations {
-            let source = DiscoverySource::Registry {
-                hive: hive_name.into(),
-                key: key_name.into(),
-                value: value_name.into(),
-                view: view.into(),
-            };
-            let key = match RegKey::predef(hive).open_subkey_with_flags(key_name, flags) {
-                Ok(key) => key,
-                Err(error) if error.kind() == ErrorKind::NotFound => {
-                    collector.not_present(source, "registry key is not present");
-                    continue;
+            for (hive, hive_name, key_name, value_name, flags, view) in locations {
+                let source = DiscoverySource::Registry {
+                    hive: hive_name.into(),
+                    key: key_name.into(),
+                    value: value_name.into(),
+                    view: view.into(),
+                };
+                let key = match RegKey::predef(hive).open_subkey_with_flags(key_name, flags) {
+                    Ok(key) => key,
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        self.not_present(source, "registry key is not present");
+                        continue;
+                    }
+                    Err(error) => {
+                        self.failed(source, format!("could not open registry key: {error}"));
+                        continue;
+                    }
+                };
+                let value: String = match key.get_value(value_name) {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        self.not_present(source, "registry value is not present");
+                        continue;
+                    }
+                    Err(error) => {
+                        self.failed(source, format!("could not read registry value: {error}"));
+                        continue;
+                    }
+                };
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    self.rejected_without_candidate(source, "registry value is empty");
+                } else {
+                    self.candidate(source, PathBuf::from(trimmed));
                 }
-                Err(error) => {
-                    collector.failed(source, format!("could not open registry key: {error}"));
-                    continue;
-                }
-            };
-            let value: String = match key.get_value(value_name) {
-                Ok(value) => value,
-                Err(error) if error.kind() == ErrorKind::NotFound => {
-                    collector.not_present(source, "registry value is not present");
-                    continue;
-                }
-                Err(error) => {
-                    collector.failed(source, format!("could not read registry value: {error}"));
-                    continue;
-                }
-            };
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                collector.rejected_without_candidate(source, "registry value is empty");
-            } else {
-                collector.candidate(
-                    source,
-                    PathBuf::from(trimmed),
-                    RejectionRecord::AttemptDetail,
-                );
             }
         }
-    }
 
-    /// A running Steam's own executable location is ground truth even when
-    /// the registry is stale or absent, which is exactly the portable-install
-    /// case the other sources miss.
-    fn running_steam_candidates(collector: &mut RootCollector) {
-        let source = DiscoverySource::Process {
-            executable: STEAM_IMAGE_NAME.into(),
-        };
-        match process::executable_paths(STEAM_IMAGE_NAME) {
-            Err(detail) => collector.failed(
-                source,
-                format!("could not enumerate running processes: {detail}"),
-            ),
-            Ok(processes) if processes.matched == 0 && processes.failures.is_empty() => {
-                collector.not_present(source, "steam.exe is not running");
-            }
-            Ok(processes) => {
-                for path in processes.paths {
-                    if let Some(directory) = path.parent() {
-                        collector.candidate(
-                            source.clone(),
-                            directory.to_path_buf(),
-                            RejectionRecord::AttemptDetail,
-                        );
-                    } else {
-                        collector.failed(
-                            source.clone(),
-                            format!(
-                                "queried steam.exe path '{}' has no parent directory",
-                                path.display()
-                            ),
-                        );
+        /// A running Steam's own executable location is ground truth even when
+        /// the registry is stale or absent, which is exactly the portable-install
+        /// case the other sources miss.
+        fn running_steam_candidates(&mut self) {
+            let source = DiscoverySource::Process {
+                executable: STEAM_IMAGE_NAME.into(),
+            };
+            match process::executable_paths(STEAM_IMAGE_NAME) {
+                Err(detail) => self.failed(
+                    source,
+                    format!("could not enumerate running processes: {detail}"),
+                ),
+                Ok(processes) if processes.matched == 0 && processes.failures.is_empty() => {
+                    self.not_present(source, "steam.exe is not running");
+                }
+                Ok(processes) => {
+                    for path in processes.paths {
+                        if let Some(directory) = path.parent() {
+                            self.candidate(source.clone(), directory.to_path_buf());
+                        } else {
+                            self.failed(
+                                source.clone(),
+                                format!(
+                                    "queried steam.exe path '{}' has no parent directory",
+                                    path.display()
+                                ),
+                            );
+                        }
+                    }
+                    for failure in processes.failures {
+                        self.failed(source.clone(), failure);
                     }
                 }
-                for failure in processes.failures {
-                    collector.failed(source.clone(), failure);
-                }
             }
         }
-    }
 
-    fn default_candidates(collector: &mut RootCollector) {
-        for variable in ["ProgramFiles(x86)", "ProgramFiles"] {
-            let source = DiscoverySource::Environment {
-                variable: variable.into(),
-            };
-            match std::env::var_os(variable) {
-                Some(value) if !value.is_empty() => {
-                    collector.candidate(
-                        source,
-                        PathBuf::from(value).join("Steam"),
-                        RejectionRecord::AttemptDetail,
-                    );
+        fn default_candidates(&mut self) {
+            for variable in ["ProgramFiles(x86)", "ProgramFiles"] {
+                let source = DiscoverySource::Environment {
+                    variable: variable.into(),
+                };
+                match std::env::var_os(variable) {
+                    Some(value) if !value.is_empty() => {
+                        self.candidate(source, PathBuf::from(value).join("Steam"));
+                    }
+                    _ => self.not_present(source, "environment variable is not set"),
                 }
-                _ => collector.not_present(source, "environment variable is not set"),
             }
-        }
-        for candidate in [
-            PathBuf::from(r"C:\Program Files (x86)\Steam"),
-            PathBuf::from(r"C:\Program Files\Steam"),
-        ] {
-            collector.candidate(
-                DiscoverySource::Conventional {
-                    description: candidate.display().to_string(),
-                },
-                candidate,
-                RejectionRecord::AttemptDetail,
-            );
+            for candidate in [
+                PathBuf::from(r"C:\Program Files (x86)\Steam"),
+                PathBuf::from(r"C:\Program Files\Steam"),
+            ] {
+                self.candidate(
+                    DiscoverySource::Conventional {
+                        description: candidate.display().to_string(),
+                    },
+                    candidate,
+                );
+            }
         }
     }
 }
@@ -348,21 +333,21 @@ mod process {
         }
     }
 
-    pub(super) struct RunningProcesses {
+    pub struct RunningProcesses {
         /// Full executable paths of the matching processes whose path could
         /// be queried.
-        pub(super) paths: Vec<PathBuf>,
+        pub paths: Vec<PathBuf>,
         /// Number of processes whose image name matched, whether or not a
         /// path could be queried for them.
-        pub(super) matched: usize,
+        pub matched: usize,
         /// Enumeration or path-query failures retained alongside successful
         /// paths so one readable process cannot hide an unreadable sibling.
-        pub(super) failures: Vec<String>,
+        pub failures: Vec<String>,
     }
 
     /// Enumerate running processes and report the executable paths of every
     /// one whose image name matches `image_name` (ASCII, case-insensitive).
-    pub(super) fn executable_paths(image_name: &str) -> Result<RunningProcesses, String> {
+    pub fn executable_paths(image_name: &str) -> Result<RunningProcesses, String> {
         // SAFETY: the flag requests a process snapshot; the process id
         // argument is documented as ignored for that flag.
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };

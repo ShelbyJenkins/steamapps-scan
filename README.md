@@ -106,7 +106,7 @@ numeric parsing are omitted as ambiguous and retain a warning diagnostic.
 ## Executable versions
 
 A resolved `ExecutablePath` can report the version its file advertises,
-read from the Windows `VS_VERSIONINFO` resource — the same data the
+read from the Windows `VS_VERSIONINFO` resource: the same data the
 Explorer property sheet shows. It is a plain file read; nothing is
 executed.
 

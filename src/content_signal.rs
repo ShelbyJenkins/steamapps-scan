@@ -7,21 +7,14 @@
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
+    num::{NonZeroU32, NonZeroU64},
     path::{Path, PathBuf},
 };
 
 use serde::Deserialize;
 
-use super::report::{AppInstall, Diagnostic, DiscoveryStage, StateFlags};
+use super::report::{AppInstall, MetadataReadErr, StateFlags};
 use crate::internal::scan::read_metadata;
-
-const SCHEME: &str = "steam-app-manifest-v1";
-
-/// Canonical identity for the currently installed Steam app content.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SteamContentSignal {
-    value: String,
-}
 
 /// Failure to reread or validate an app manifest for a content signal.
 #[derive(Debug, thiserror::Error)]
@@ -29,14 +22,14 @@ pub struct SteamContentSignal {
 pub enum ContentSignalErr {
     /// The bounded metadata read failed.
     #[error(transparent)]
-    Metadata(#[from] Box<Diagnostic>),
+    Metadata(#[from] MetadataReadErr),
     /// Valve `KeyValues` content could not be parsed.
     #[error("{}: could not parse app {app_id} content manifest: {message}", path.display())]
     Parse {
         /// Manifest path.
         path: PathBuf,
         /// Expected Steam app ID.
-        app_id: u32,
+        app_id: NonZeroU32,
         /// Parser detail.
         message: String,
     },
@@ -46,43 +39,35 @@ pub enum ContentSignalErr {
         /// Manifest path.
         path: PathBuf,
         /// Expected Steam app ID.
-        app_id: u32,
+        app_id: NonZeroU32,
         /// Validation detail.
         message: String,
     },
 }
 
-#[derive(Debug, Deserialize)]
-struct ContentManifest {
-    appid: u32,
-    buildid: u64,
-    #[serde(rename = "StateFlags")]
-    state_flags: u64,
-    #[serde(rename = "InstalledDepots", default)]
-    installed_depots: BTreeMap<String, InstalledDepot>,
-}
-
-#[derive(Debug, Deserialize)]
-struct InstalledDepot {
-    manifest: u64,
-}
-
-impl AppInstall {
-    /// Reread this app's manifest and derive its canonical content signal.
-    ///
-    /// The manifest must still identify this app and report Steam's fully
-    /// installed state. Workshop and locally modified content are outside the
-    /// signal and require caller-supplied identity when relevant.
-    pub fn content_signal(&self) -> Result<SteamContentSignal, ContentSignalErr> {
-        SteamContentSignal::read(self)
+impl ContentSignalErr {
+    fn invalid(path: &Path, app_id: NonZeroU32, message: impl Into<String>) -> Self {
+        Self::Invalid {
+            path: path.to_path_buf(),
+            app_id,
+            message: message.into(),
+        }
     }
 }
 
+/// Canonical identity for the currently installed Steam app content.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SteamContentSignal {
+    value: String,
+}
+
 impl SteamContentSignal {
+    const SCHEME: &str = "steam-app-manifest-v1";
+
     /// Stable signal scheme.
     #[must_use]
     pub const fn scheme(&self) -> &'static str {
-        SCHEME
+        Self::SCHEME
     }
 
     /// Canonical app, build, and installed-depot value.
@@ -93,11 +78,15 @@ impl SteamContentSignal {
 
     fn read(app: &AppInstall) -> Result<Self, ContentSignalErr> {
         let path = app.manifest_path().path();
-        let text = read_metadata(path, DiscoveryStage::ReadManifest, Some(app.app_id()))?;
+        let text = read_metadata(path)?;
         Self::parse(app.app_id(), path, &text)
     }
 
-    fn parse(expected_app_id: u32, path: &Path, text: &str) -> Result<Self, ContentSignalErr> {
+    fn parse(
+        expected_app_id: NonZeroU32,
+        path: &Path,
+        text: &str,
+    ) -> Result<Self, ContentSignalErr> {
         let (manifest, root_key): (ContentManifest, _) =
             keyvalues_serde::from_str_with_key(text).map_err(|source| ContentSignalErr::Parse {
                 path: path.to_path_buf(),
@@ -111,7 +100,7 @@ impl SteamContentSignal {
                 format!("top-level key is '{root_key}', expected 'AppState'"),
             ));
         }
-        if manifest.appid != expected_app_id {
+        if manifest.appid != expected_app_id.get() {
             return Err(ContentSignalErr::invalid(
                 path,
                 expected_app_id,
@@ -132,13 +121,13 @@ impl SteamContentSignal {
                 ),
             ));
         }
-        if manifest.buildid == 0 {
+        let Some(build_id) = NonZeroU64::new(manifest.buildid) else {
             return Err(ContentSignalErr::invalid(
                 path,
                 expected_app_id,
                 "build ID is zero",
             ));
-        }
+        };
 
         let mut depots = BTreeMap::new();
         for (raw_depot_id, depot) in manifest.installed_depots {
@@ -149,14 +138,16 @@ impl SteamContentSignal {
                     format!("installed depot ID '{raw_depot_id}' is not an unsigned integer"),
                 )
             })?;
-            if depot_id == 0 || depot.manifest == 0 {
+            let (Some(depot_id), Some(manifest_id)) =
+                (NonZeroU64::new(depot_id), NonZeroU64::new(depot.manifest))
+            else {
                 return Err(ContentSignalErr::invalid(
                     path,
                     expected_app_id,
                     format!("installed depot '{raw_depot_id}' has a zero depot or manifest ID"),
                 ));
-            }
-            if depots.insert(depot_id, depot.manifest).is_some() {
+            };
+            if depots.insert(depot_id, manifest_id).is_some() {
                 return Err(ContentSignalErr::invalid(
                     path,
                     expected_app_id,
@@ -167,10 +158,7 @@ impl SteamContentSignal {
             }
         }
 
-        let mut value = format!(
-            "appid={expected_app_id};buildid={};depots=",
-            manifest.buildid
-        );
+        let mut value = format!("appid={expected_app_id};buildid={build_id};depots=");
         for (index, (depot_id, manifest_id)) in depots.into_iter().enumerate() {
             if index != 0 {
                 value.push(',');
@@ -185,14 +173,30 @@ impl SteamContentSignal {
     }
 }
 
-impl ContentSignalErr {
-    fn invalid(path: &Path, app_id: u32, message: impl Into<String>) -> Self {
-        Self::Invalid {
-            path: path.to_path_buf(),
-            app_id,
-            message: message.into(),
-        }
+impl AppInstall {
+    /// Reread this app's manifest and derive its canonical content signal.
+    ///
+    /// The manifest must still identify this app and report Steam's fully
+    /// installed state. Workshop and locally modified content are outside the
+    /// signal and require caller-supplied identity when relevant.
+    pub fn content_signal(&self) -> Result<SteamContentSignal, ContentSignalErr> {
+        SteamContentSignal::read(self)
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ContentManifest {
+    appid: u32,
+    buildid: u64,
+    #[serde(rename = "StateFlags")]
+    state_flags: u64,
+    #[serde(rename = "InstalledDepots", default)]
+    installed_depots: BTreeMap<String, InstalledDepot>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstalledDepot {
+    manifest: u64,
 }
 
 #[cfg(test)]
@@ -211,6 +215,10 @@ mod tests {
     use super::{super::paths::LibraryRoot, *};
 
     const APP_ID: u32 = 42;
+
+    fn app_id() -> NonZeroU32 {
+        NonZeroU32::new(APP_ID).expect("fixture app ID is nonzero")
+    }
 
     fn manifest(installed_depots: &str) -> String {
         format!(
@@ -233,7 +241,7 @@ mod tests {
         let text = manifest(
             "\t\t\"20\"\n\t\t{\n\t\t\t\"manifest\"\t\"900\"\n\t\t}\n\t\t\"3\"\n\t\t{\n\t\t\t\"manifest\"\t\"800\"\n\t\t}\n",
         );
-        let signal = SteamContentSignal::parse(APP_ID, Path::new("fixture.acf"), &text)
+        let signal = SteamContentSignal::parse(app_id(), Path::new("fixture.acf"), &text)
             .expect("parse complete manifest");
 
         assert_eq!(signal.scheme(), "steam-app-manifest-v1");
@@ -247,7 +255,7 @@ mod tests {
 
     #[test]
     fn no_depots_has_an_empty_canonical_suffix() {
-        let signal = SteamContentSignal::parse(APP_ID, Path::new("fixture.acf"), &manifest(""))
+        let signal = SteamContentSignal::parse(app_id(), Path::new("fixture.acf"), &manifest(""))
             .expect("parse no-depots manifest");
 
         assert_eq!(signal.value(), "appid=42;buildid=12345678;depots=");
@@ -256,7 +264,7 @@ mod tests {
     #[test]
     fn transitional_state_is_rejected() {
         let text = manifest("").replace("\"StateFlags\"\t\"4\"", "\"StateFlags\"\t\"1026\"");
-        let error = SteamContentSignal::parse(APP_ID, Path::new("fixture.acf"), &text)
+        let error = SteamContentSignal::parse(app_id(), Path::new("fixture.acf"), &text)
             .expect_err("transitional install must fail");
 
         assert!(error.to_string().contains("transitioning"));
@@ -268,7 +276,7 @@ mod tests {
         fs::write(&path, manifest("")).expect("write content manifest fixture");
         let root = path.parent().expect("fixture parent").to_path_buf();
         let app = AppInstall::from_scanned(
-            NonZeroU32::new(APP_ID).expect("fixture app ID is nonzero"),
+            app_id(),
             None,
             "fixture".into(),
             super::super::paths::ManifestPath(path.clone()),
@@ -288,7 +296,7 @@ mod tests {
         let text = manifest(
             "\t\t\"3\"\n\t\t{\n\t\t\t\"manifest\"\t\"800\"\n\t\t}\n\t\t\"03\"\n\t\t{\n\t\t\t\"manifest\"\t\"900\"\n\t\t}\n",
         );
-        let error = SteamContentSignal::parse(APP_ID, Path::new("fixture.acf"), &text)
+        let error = SteamContentSignal::parse(app_id(), Path::new("fixture.acf"), &text)
             .expect_err("numeric duplicate must fail");
 
         assert!(error.to_string().contains("duplicates"));

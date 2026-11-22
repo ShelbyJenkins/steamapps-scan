@@ -62,9 +62,9 @@ pub use query::{
     MatchErr, MatchReport, QueryErr,
 };
 pub use report::{
-    AppInstall, AppMetadata, AttemptOutcome, Diagnostic, DiagnosticKind, DiagnosticSeverity,
-    Discovery, DiscoveryAttempt, DiscoverySource, DiscoveryStage, DiscoveryState, InstalledDepot,
-    StateFlags, SteamInventory,
+    AppInstall, AppMetadata, AttemptEvidence, AttemptOutcome, Diagnostic, DiagnosticKind,
+    DiagnosticSeverity, Discovery, DiscoveryAttempt, DiscoverySource, DiscoveryStage,
+    DiscoveryState, InstalledDepot, MetadataReadErr, StateFlags, SteamInventory,
 };
 
 /// Maximum size accepted for `libraryfolders.vdf` or an app manifest.
