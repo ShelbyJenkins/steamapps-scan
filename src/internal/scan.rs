@@ -325,7 +325,7 @@ impl ScanPipeline {
     fn library_folders(&mut self, root: &SteamRoot) -> Vec<LibraryRoot> {
         let path = root
             .path()
-            .join("steamapps")
+            .join(LibraryRoot::APPS_DIR)
             .join(SteamRoot::LIBRARY_FOLDERS_FILE);
         let path = match FilePresence::of(&path) {
             FilePresence::Missing => return Vec::new(),
@@ -475,7 +475,7 @@ impl ScanPipeline {
     }
 
     fn apps_from_library(&mut self, library: &LibraryRoot) -> Vec<AppInstall> {
-        let steamapps = library.path().join("steamapps");
+        let steamapps = library.path().join(LibraryRoot::APPS_DIR);
         let entries = match std::fs::read_dir(&steamapps) {
             Ok(entries) => entries,
             Err(error) => {
@@ -706,7 +706,7 @@ impl ScanPipeline {
             return None;
         }
 
-        let common = library.path().join("steamapps").join("common");
+        let common = library.path().join(LibraryRoot::APPS_DIR).join("common");
         let normalized_common = common.normalize();
         let candidate = common.join(raw_install).normalize();
         if !candidate.starts_with(&normalized_common) {

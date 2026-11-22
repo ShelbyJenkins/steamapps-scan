@@ -137,7 +137,7 @@ impl SteamRoot {
     pub fn from_dir(path: impl AsRef<Path>) -> Result<Self, ValidationErr> {
         let path = path.as_ref();
         let root = canonical_directory(path, "Steam root")?;
-        let steamapps = root.join("steamapps");
+        let steamapps = root.join(LibraryRoot::APPS_DIR);
         canonical_directory(&steamapps, "Steam apps directory")?;
 
         let library_folders = FilePresence::of(&steamapps.join(Self::LIBRARY_FOLDERS_FILE));
@@ -197,11 +197,15 @@ impl TryFrom<PathBuf> for SteamRoot {
 }
 
 impl LibraryRoot {
+    /// Directory under every library, Steam roots included, that holds app
+    /// manifests and the `common` installation directories.
+    pub(super) const APPS_DIR: &str = "steamapps";
+
     /// Validate a caller-provided Steam library directory.
     pub fn from_dir(path: impl AsRef<Path>) -> Result<Self, ValidationErr> {
         let path = path.as_ref();
         let root = canonical_directory(path, "Steam library root")?;
-        canonical_directory(&root.join("steamapps"), "Steam library apps directory")?;
+        canonical_directory(&root.join(Self::APPS_DIR), "Steam library apps directory")?;
         Ok(Self(root))
     }
 }
@@ -280,14 +284,25 @@ pub fn canonical_directory(path: &Path, role: &str) -> Result<PathBuf, Validatio
             ),
         )
     })?;
-    if !canonical.is_dir() {
-        return Err(ValidationErr::new(
+    // `Path::is_dir` reports every inspection failure as "not a directory";
+    // reading the metadata keeps an I/O failure classified as one.
+    match std::fs::metadata(&canonical) {
+        Ok(metadata) if metadata.is_dir() => Ok(canonical),
+        Ok(_) => Err(ValidationErr::new(
             ValidationErrKind::InvalidType,
             path,
             format!("{}: {role} is not a directory", path.display()),
-        ));
+        )),
+        Err(error) => Err(ValidationErr::new(
+            if error.kind() == ErrorKind::NotFound {
+                ValidationErrKind::NotFound
+            } else {
+                ValidationErrKind::Io
+            },
+            path,
+            format!("{}: {role} could not be inspected: {error}", path.display()),
+        )),
     }
-    Ok(canonical)
 }
 
 impl ManifestPath {

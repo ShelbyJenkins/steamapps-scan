@@ -203,9 +203,11 @@ impl ExecutableMatch {
 }
 
 /// Number of matches retained by an executable query.
+///
+/// Exhaustive by design: the three variants cover every possible count, so
+/// callers can match without a wildcard arm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-#[non_exhaustive]
 pub enum MatchCardinality {
     /// No app installation satisfied the query.
     None,
@@ -216,9 +218,10 @@ pub enum MatchCardinality {
 }
 
 /// Whether all relevant installs and candidates could be inspected.
+///
+/// Exhaustive by design: evidence is either complete or it is not.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-#[non_exhaustive]
 pub enum MatchCompleteness {
     /// Every relevant source and path was inspected successfully.
     Complete,

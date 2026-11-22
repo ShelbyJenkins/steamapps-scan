@@ -354,7 +354,7 @@ fn resolve(
     let result = match report.cardinality() {
         MatchCardinality::One => Exit::Success,
         MatchCardinality::None => Exit::NothingFound,
-        MatchCardinality::Many | _ => Exit::Ambiguous,
+        MatchCardinality::Many => Exit::Ambiguous,
     };
     let evidence = if report.completeness() == MatchCompleteness::Complete
         && versions.iter().all(VersionOutput::is_readable)
