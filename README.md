@@ -1,31 +1,167 @@
 # steamapps-scan
 
-A generic Rust crate and CLI for locating Steam installations, loading a
-validated inventory of installed apps, and finding executable paths by app ID
-plus exact relative path. Automatic discovery covers Windows, Linux, and
-macOS; explicit-root scans work on all three. macOS has been validated against
-a default-location install; libraries on external volumes have not yet been
-exercised.
+Find the games someone has installed with Steam, and the exact `.exe` inside
+each one. A Rust library, with an optional command-line tool.
+
+Useful for launchers, mod managers, and anything else that needs to find a
+Steam game on someone's computer. It only reads: it never changes files or
+starts programs.
+
+## What it does
+
+- Finds Steam, even when it is installed somewhere unusual.
+- Finds games on every drive and folder Steam uses, not just the main one.
+- Lists each installed game's name, folder, size, and build number.
+- Give it a game's Steam app ID and `Bin/Game.exe`; get back the full path,
+  checked to exist.
+- Reads the version number stored inside an `.exe`, on any OS.
+- Keeps going when something is broken, and tells you what and where.
+- Scans folders you point it at, including SteamCMD server installs.
+
+## Platforms
+
+- **Windows**: finds Steam through the registry, a running Steam, or the
+  usual Program Files folders.
+- **Linux**: finds regular, Flatpak, and Snap installs, including ones in
+  custom locations.
+- **macOS**: finds Steam in its standard location,
+  `~/Library/Application Support/Steam`.
+- **Anything else**: cannot find Steam on its own, but scans any Steam folder
+  you name.
+
+Reading `.exe` versions works the same on every system, so a Windows game
+installed through Proton on Linux reports its version too.
+
+## Compared with steamlocate
+
+[`steamlocate`](https://github.com/WilliamVenner/steamlocate-rs/tree/d7a249667ceeaadffba285547106e8d809507ae9)
+is the other crate for finding Steam games. Against its version 2.1.0:
+
+- **Gives you the `.exe`.** steamlocate stops at the game's folder, without
+  checking that it exists.
+- **Survives broken files.** In steamlocate, one bad entry in Steam's library
+  list fails the whole list; here you keep the rest and get a report.
+- **Looks in more places.** On Windows, steamlocate reads only the
+  machine-wide registry entry; this also checks the per-user one, a running
+  Steam, and Program Files.
+- **Reads `.exe` versions and SteamCMD server folders.** steamlocate does
+  neither.
+- **Choose steamlocate** if you need non-Steam games added to Steam, or which
+  compatibility tool (such as a Proton version) each game is set to use.
+
+## Limitations
+
+- **macOS**: tested only with Steam in its default location. Games on
+  external drives have not been tested yet.
+- **Case-sensitive Mac drives**: two game folders whose names differ only by
+  capital letters are treated as one.
+- **Old Steam folders**: a library list in Steam's pre-2021 format, or a
+  capitalized `SteamApps` folder on Linux, is not read.
+- **SteamCMD**: a forced install is found only when its folder is not also a
+  Steam library. A game forced into SteamCMD's own folder, for example, shows
+  up as a missing install.
+- **Very old programs**: 16-bit `.exe` files, from the DOS and Windows 3.1
+  days, report no version.
+
+## Usage
+
+Every Steam game has an app ID: the number in its store page address,
+`store.steampowered.com/app/<app ID>/`.
+
+### Find a game's `.exe`
 
 ```rust,no_run
 use steamapps_scan::{Discovery, ExecutableQuery};
 
+// Find Steam and everything it has installed.
 let discovery = Discovery::discover();
 
+// The game's app ID, then where its .exe sits inside the game's folder.
+// When you list several, the first one that exists is used.
 let editor = ExecutableQuery::any_of(123_456, [
     "Editor/EditorDiagnostic.exe",
     "Editor/Editor.exe",
 ])?;
 
+// `unique` fails when the game is not installed, or is installed twice.
 let report = discovery.resolve_executable(&editor);
-if let Ok(found) = report.unique() {
-    println!("{}", found.executable());
+match report.unique() {
+    Ok(found) => println!("{}", found.executable()),
+    Err(err) => eprintln!("{err}"),
 }
 
 # Ok::<(), steamapps_scan::QueryErr>(())
 ```
 
-## Why inventory first?
+### List installed games, and anything that went wrong
+
+```rust,no_run
+use steamapps_scan::Discovery;
+
+let discovery = Discovery::discover();
+
+// Complete, Partial (something failed, but you still get the rest),
+// NotFound, or Unsupported.
+println!("{:?}", discovery.state());
+
+for app in discovery.inventory().apps() {
+    println!("{} {}", app.app_id(), app.name().unwrap_or("unnamed"));
+}
+
+for problem in discovery.diagnostics() {
+    eprintln!("{}", problem.message);
+}
+```
+
+### Scan a folder you choose
+
+```rust,no_run
+use steamapps_scan::Discovery;
+
+// Skip the search and scan these Steam folders instead.
+let discovery = Discovery::discover_from(["/mnt/games/Steam"]);
+println!("{} apps", discovery.inventory().apps().len());
+```
+
+### Read an `.exe` version
+
+```rust,no_run
+# use steamapps_scan::ExecutablePath;
+# fn example(exe: &ExecutablePath) -> Result<(), steamapps_scan::VersionErr> {
+// `None` when the .exe carries no version at all, which is common.
+if let Some(version) = exe.version()? {
+    // Exactly as the developer wrote it, such as "1.7.0.54" or "1, 0, 0, 1".
+    println!("{:?}", version.product_version);
+}
+# Ok(())
+# }
+```
+
+### Command-line tool
+
+Install from a clone of this repository:
+
+```text
+cargo install --path . --features cli
+```
+
+```text
+steamapps-scan scan                 # find Steam and print everything it found
+steamapps-scan apps                 # list installed games; --app-id 123 for one game
+steamapps-scan resolve 123 Game.exe # print a game's .exe path; --version adds its version
+steamapps-scan signal 123           # print a fingerprint of the installed build
+```
+
+The fingerprint from `signal` changes whenever Steam updates the game. Add
+`--root <DIR>` (repeatable) to scan folders you choose, and `--json` for
+machine-readable output.
+
+## Technical details
+
+You do not need this section to use the crate. It describes exactly how
+discovery, reporting, and parsing behave.
+
+### Why inventory first?
 
 One Steam app can ship several programs. Looking up only an app ID cannot say
 which executable the caller wants. `steamapps-scan` loads manifests once,
@@ -41,7 +177,32 @@ let server = ExecutableQuery::new(123_456, "DedicatedServer.exe")?;
 Each match carries the exact `AppInstall` that supplied it, so duplicate app
 installs across libraries cannot be mixed together.
 
-## Reporting
+### Where Steam is looked for
+
+On Windows, automatic discovery checks:
+
+- `HKCU\Software\Valve\Steam\SteamPath`;
+- `HKLM\SOFTWARE\Wow6432Node\Valve\Steam\InstallPath`;
+- `HKLM\SOFTWARE\Valve\Steam\InstallPath`;
+- running `steam.exe` processes, enumerated directly through the Tool Help
+  API rather than by spawning a shell;
+- environment-derived and conventional install paths.
+
+On Linux, automatic discovery checks `$XDG_DATA_HOME/Steam`, the
+`~/.local/share/Steam` default, the client-maintained `~/.steam/steam` and
+`~/.steam/root` pointers, `~/.steam/debian-installation`, and the Flatpak and
+Snap locations under `~/.var/app/com.valvesoftware.Steam` and
+`~/snap/steam/common`. The `~/.steam` pointers are written by the Steam
+client wherever it actually runs from, so custom install locations are found
+without a process probe.
+
+On macOS, automatic discovery checks `~/Library/Application Support/Steam`,
+the only location the client uses for its data tree.
+
+Explicit-root scans use only portable `std::fs` operations and support
+Steam-compatible layouts on Windows, Linux, and macOS.
+
+### Reporting
 
 Discovery is non-lossy. The report includes:
 
@@ -64,38 +225,13 @@ those links directly. Executable reports share immutable scan diagnostics and
 keep query-specific diagnostics separately; `MatchReport::diagnostics` iterates
 over both in reporting order.
 
-On Windows, automatic discovery checks:
+On Windows and macOS, roots, libraries, and installations are deduplicated
+case-insensitively. On a case-sensitive APFS volume, two that differ only by
+case merge; the attempts ledger and the duplicate warnings still record both.
 
-- `HKCU\Software\Valve\Steam\SteamPath`;
-- `HKLM\SOFTWARE\Wow6432Node\Valve\Steam\InstallPath`;
-- `HKLM\SOFTWARE\Valve\Steam\InstallPath`;
-- running `steam.exe` processes, enumerated directly through the Tool Help
-  API rather than by spawning a shell;
-- environment-derived and conventional install paths.
+### steamcmd `force_install_dir` folders
 
-On Linux, automatic discovery checks `$XDG_DATA_HOME/Steam`, the
-`~/.local/share/Steam` default, the client-maintained `~/.steam/steam` and
-`~/.steam/root` pointers, `~/.steam/debian-installation`, and the Flatpak and
-Snap locations under `~/.var/app/com.valvesoftware.Steam` and
-`~/snap/steam/common`. The `~/.steam` pointers are written by the Steam
-client wherever it actually runs from, so custom install locations are found
-without a process probe. Only the modern lowercase `steamapps` layout is
-supported.
-
-On macOS, automatic discovery checks `~/Library/Application Support/Steam`,
-the only location the client uses for its data tree. This has been validated
-against a default-location install; libraries on external volumes have not
-yet been exercised.
-
-Compared with [`steamlocate` 2.1.0](https://github.com/WilliamVenner/steamlocate-rs/tree/d7a249667ceeaadffba285547106e8d809507ae9),
-this crate is focused on broader root discovery, validated executable path
-resolution, and retaining partial results plus all subordinate diagnostics.
-`steamlocate` additionally parses non-Steam shortcuts (`shortcuts.vdf`, a
-binary format) and Proton compat-tool mappings; both are out of scope here.
-Explicit-root scans with this crate use only portable `std::fs` operations
-and support Steam-compatible layouts on Windows, Linux, and macOS.
-
-An explicit root can also be a folder filled by steamcmd's `force_install_dir`,
+An explicit root can be a folder filled by steamcmd's `force_install_dir`,
 which commits every app straight into the folder. A root that no
 `libraryfolders.vdf` registers and that holds none of the files Steam keeps in
 its own libraries (`steamapps/libraryfolders.vdf`, `libraryfolder.vdf`,
@@ -109,7 +245,7 @@ An install forced into a folder that does hold Steam's library files, such as
 steamcmd's own root, is not supported: its manifests are reported as missing
 `steamapps/common` installations.
 
-## App metadata
+### App metadata
 
 Each inventoried app carries advisory manifest metadata parsed leniently:
 install-state flags, build ID, size on disk, last-updated time, selected
@@ -123,22 +259,11 @@ A value that is present but malformed, including a zero build, depot,
 manifest, or DLC ID, and a depot key that is not a depot ID each leave a
 warning diagnostic naming what was omitted; a missing value leaves none.
 
-## Executable versions
+### Executable versions
 
-A resolved `ExecutablePath` can report the version its file advertises,
-read from the Windows `VS_VERSIONINFO` resource: the same data the
-Explorer property sheet shows. It is a plain file read; nothing is
+The version is read from the Windows `VS_VERSIONINFO` resource: the same data
+the Explorer property sheet shows. It is a plain file read; nothing is
 executed.
-
-```rust,no_run
-# use steamapps_scan::ExecutablePath;
-# fn example(exe: &ExecutablePath) -> Result<(), steamapps_scan::VersionErr> {
-if let Some(version) = exe.version()? {
-    println!("{:?}", version.product_version);
-}
-# Ok(())
-# }
-```
 
 The resource is optional, so an executable carrying none reports
 `Ok(None)` rather than failing. It holds two independent records that
@@ -154,34 +279,18 @@ The resource is parsed from the file itself rather than through a Windows
 API, so every target reads it the same way, including Windows games
 installed through Proton on Linux, and callers need no `cfg`.
 
-## Manual roots
+### CLI exit codes
 
-A caller can bypass automatic location and scan known roots on any platform
-with a Steam-compatible filesystem layout:
+| Code | Meaning |
+| ---- | ------- |
+| 0 | Success |
+| 1 | Nothing found: no Steam, no apps, or no match |
+| 2 | Usage error, including Steam app ID zero |
+| 3 | Ambiguous: more than one match where exactly one is needed |
+| 4 | Partial: a result was produced, but some evidence could not be read |
+| 5 | Automatic discovery is unsupported on this platform |
+| 6 | No result produced: a content signal could not be derived, or the output could not be serialized or written |
 
-```rust,no_run
-use steamapps_scan::Discovery;
-
-let discovery = Discovery::discover_from(["/mnt/games/Steam"]);
-println!("{} apps", discovery.inventory().apps().len());
-```
-
-## CLI
-
-The `cli` feature builds a `steamapps-scan` binary over the same public
-API:
-
-```text
-steamapps-scan scan                 # full report; --json for the serialized form
-steamapps-scan apps --app-id 123    # list inventoried installations
-steamapps-scan resolve 123 Game.exe # resolve executables; --version reads versions
-steamapps-scan signal 123          # content signal for a unique installation
-```
-
-Every subcommand accepts repeated `--root <DIR>` to scan explicit roots
-instead of automatic discovery, and `--json` to emit the serialized report.
-Exit codes: 0 success, 1 nothing found, 2 usage error, 3 ambiguous result,
-4 partial evidence, 5 platform unsupported. Discovery errors or an unsupported
-state take precedence over a subcommand's match result; a requested version
-read or JSON serialization failure is also partial. Steam app ID zero is a
-usage error.
+An unsupported platform takes precedence over every other code, and partial
+evidence then takes precedence over a subcommand's own result. A failed
+version read counts as partial evidence.
