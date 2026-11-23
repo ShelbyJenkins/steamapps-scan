@@ -39,8 +39,8 @@ use std::{
 use steamapps_scan::{
     AppInstall, AppMetadata, AttemptOutcome, DiagnosticKind, DiagnosticSeverity, Discovery,
     DiscoveryAttempt, DiscoverySource, DiscoveryStage, DiscoveryState, ExecutableMatch,
-    ExecutablePath, ExecutableQuery, ExecutableTarget, MAX_STEAM_METADATA_BYTES, MatchCardinality,
-    MatchCompleteness, MatchErr, MatchReport, QueryErr, StateFlags, SteamRoot,
+    ExecutablePath, ExecutableQuery, ExecutableTarget, LibraryLayout, MAX_STEAM_METADATA_BYTES,
+    MatchCardinality, MatchCompleteness, MatchErr, MatchReport, QueryErr, StateFlags, SteamRoot,
 };
 
 #[cfg(feature = "cli")]

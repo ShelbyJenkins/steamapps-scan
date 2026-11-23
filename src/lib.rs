@@ -55,8 +55,8 @@ mod internal;
 pub use content_signal::{ContentSignalErr, SteamContentSignal};
 pub use file_version::{FileVersion, VersionErr};
 pub use paths::{
-    ExecutablePath, InstallDir, LibraryRoot, ManifestPath, RelativeExecutablePath, SteamRoot,
-    ValidationErr, ValidationErrKind,
+    ExecutablePath, InstallDir, LibraryLayout, LibraryRoot, ManifestPath, RelativeExecutablePath,
+    SteamRoot, ValidationErr, ValidationErrKind,
 };
 pub use query::{
     ExecutableMatch, ExecutableQuery, ExecutableTarget, MatchCardinality, MatchCompleteness,

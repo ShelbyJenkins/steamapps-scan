@@ -277,6 +277,7 @@ fn manifest_install_dir_cannot_escape_common() {
         format!("steamapps/appmanifest_{APP_ID}.acf"),
         TempTree::manifest(APP_ID, APP_ID, "../../outside", "Traversal"),
     );
+    steam.dir("steamapps/common");
 
     let discovery = steam.discover();
 
@@ -306,6 +307,149 @@ fn manifest_install_dir_cannot_claim_all_of_common() {
         diagnostic.kind == DiagnosticKind::OutsideBoundary
             && diagnostic.message.contains("escapes steamapps/common")
     }));
+}
+
+#[test]
+fn force_install_dir_apps_live_in_the_library_only_without_steam_markers() {
+    const GAME: u32 = 42;
+    const REDIST: u32 = 43;
+    let forced = TempTree::new("force-install-dir");
+    for (app_id, name) in [(GAME, "Game"), (REDIST, "Redist")] {
+        forced.file(
+            format!("steamapps/appmanifest_{app_id}.acf"),
+            // steamcmd has written LastUpdated in lower case.
+            TempTree::manifest(app_id, app_id, name, name)
+                .replace("\n}", "\n\t\"lastupdated\"\t\"1793920851\"\n}"),
+        );
+    }
+    let executable = forced.file("Game.exe", "");
+
+    let discovery = forced.discover();
+
+    assert_eq!(
+        discovery.state(),
+        DiscoveryState::Complete,
+        "{:#?}",
+        discovery.diagnostics()
+    );
+    assert_eq!(
+        discovery.inventory().libraries()[0].layout(),
+        LibraryLayout::ForceInstallDir
+    );
+    let folder = dunce::canonicalize(forced.root()).unwrap();
+    assert_eq!(discovery.inventory().apps().len(), 2);
+    assert!(discovery.inventory().apps().iter().all(|app| {
+        app.path() == folder.as_path() && app.metadata().last_updated == Some(1_793_920_851)
+    }));
+    let report = discovery.resolve_executable(&ExecutableQuery::new(GAME, "Game.exe").unwrap());
+    assert_eq!(
+        report.unique().unwrap().executable().path(),
+        dunce::canonicalize(&executable).unwrap()
+    );
+    let json = serde_json::to_value(discovery.inventory()).unwrap();
+    let library = serde_json::json!({ "path": folder, "layout": "force_install_dir" });
+    assert_eq!(json["library_roots"], serde_json::json!([library]));
+    assert_eq!(json["apps"][0]["library_root"], library);
+
+    // Steam's own library files keep the common layout, and so does being
+    // registered in a libraryfolders.vdf, whichever order the roots come in.
+    // A manifest whose common directory is missing is then reported rather
+    // than resolved to the library itself.
+    let marked = TempTree::new("marked-without-common");
+    marked.file("libraryfolder.vdf", "\"libraryfolder\"\n{\n}\n");
+    let root = TempTree::new("root-without-common");
+    root.library_folders(&[root.root()]);
+    let registered = TempTree::new("registered-without-markers");
+    let registering = TempTree::new("registering-root");
+    registering.library_folders(&[registering.root(), registered.root()]);
+    for library in [&marked, &root, &registered] {
+        library.file(
+            format!("steamapps/appmanifest_{GAME}.acf"),
+            TempTree::manifest(GAME, GAME, "Game", "Game"),
+        );
+    }
+    for (library, discovery) in [
+        (&marked, marked.discover()),
+        (&root, root.discover()),
+        (&registered, registering.discover()),
+        (
+            &registered,
+            Discovery::discover_from([registered.root(), registering.root()]),
+        ),
+        (
+            &registered,
+            Discovery::discover_from([registering.root(), registered.root()]),
+        ),
+    ] {
+        let listed = discovery
+            .inventory()
+            .libraries()
+            .iter()
+            .find(|listed| listed.path() == library.root())
+            .expect("the library is listed");
+        assert_eq!(listed.layout(), LibraryLayout::Common);
+        assert_eq!(discovery.inventory().apps(), []);
+        assert!(discovery.diagnostics().iter().any(|diagnostic| {
+            diagnostic.stage == DiscoveryStage::ValidateInstall
+                && diagnostic.kind == DiagnosticKind::NotFound
+                && diagnostic.app_id == Some(fixture_app_id(GAME))
+                && diagnostic.path.as_deref()
+                    == Some(library.root().join("steamapps").join("common").as_path())
+        }));
+    }
+}
+
+#[test]
+fn force_install_dir_needs_installed_files_and_a_plain_installdir() {
+    const MANIFEST_ONLY: u32 = 44;
+    let manifest_only = TempTree::new("forced-manifest-only");
+    manifest_only.file(
+        format!("steamapps/appmanifest_{MANIFEST_ONLY}.acf"),
+        TempTree::manifest(MANIFEST_ONLY, MANIFEST_ONLY, "Game", "Game"),
+    );
+
+    let discovery = manifest_only.discover();
+
+    assert_eq!(discovery.state(), DiscoveryState::Partial);
+    assert_eq!(
+        discovery.inventory().libraries()[0].layout(),
+        LibraryLayout::ForceInstallDir
+    );
+    assert_eq!(discovery.inventory().apps(), []);
+    assert!(discovery.diagnostics().iter().any(|diagnostic| {
+        diagnostic.stage == DiscoveryStage::ValidateInstall
+            && diagnostic.kind == DiagnosticKind::NotFound
+            && diagnostic.app_id == Some(fixture_app_id(MANIFEST_ONLY))
+            && diagnostic.path.as_deref() == Some(manifest_only.root())
+    }));
+
+    // Installed files do not excuse an installdir that the common layout
+    // would reject, although nothing on disk is named by it.
+    let forced = TempTree::new("forced-installdir");
+    forced.file("Game.exe", "");
+    let declared = [(45, "../../outside"), (46, "/etc"), (47, ""), (48, ".")];
+    for (app_id, installdir) in declared {
+        forced.file(
+            format!("steamapps/appmanifest_{app_id}.acf"),
+            TempTree::manifest(app_id, app_id, installdir, "Invalid"),
+        );
+    }
+
+    let discovery = forced.discover();
+
+    assert_eq!(discovery.state(), DiscoveryState::Partial);
+    assert_eq!(discovery.inventory().apps(), []);
+    for (app_id, installdir) in declared {
+        assert!(
+            discovery.diagnostics().iter().any(|diagnostic| {
+                diagnostic.stage == DiscoveryStage::ValidateInstall
+                    && diagnostic.kind == DiagnosticKind::InvalidData
+                    && diagnostic.app_id == Some(fixture_app_id(app_id))
+            }),
+            "installdir '{installdir}' is rejected: {:#?}",
+            discovery.diagnostics()
+        );
+    }
 }
 
 #[test]

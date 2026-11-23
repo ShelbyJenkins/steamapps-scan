@@ -45,7 +45,9 @@ installs across libraries cannot be mixed together.
 
 Discovery is non-lossy. The report includes:
 
-- every accepted Steam root, library, and valid app manifest;
+- every accepted Steam root, library, and valid app manifest, with one app
+  entry per installation directory: another manifest for the same directory,
+  reached through a directory link, leaves a `duplicate` warning instead;
 - every root lookup attempt and its source/outcome;
 - structured diagnostics with severity, stage, kind, path, source, and app ID;
 - an overall `complete`, `partial`, `not_found`, or `unsupported` state.
@@ -92,6 +94,20 @@ resolution, and retaining partial results plus all subordinate diagnostics.
 binary format) and Proton compat-tool mappings; both are out of scope here.
 Explicit-root scans with this crate use only portable `std::fs` operations
 and support Steam-compatible layouts on Windows, Linux, and macOS.
+
+An explicit root can also be a folder filled by steamcmd's `force_install_dir`,
+which commits every app straight into the folder. A root that no
+`libraryfolders.vdf` registers and that holds none of the files Steam keeps in
+its own libraries (`steamapps/libraryfolders.vdf`, `libraryfolder.vdf`,
+`steamapps/common`) reports the `force_install_dir` layout. Each of its apps is
+installed in the folder itself once the folder holds anything besides
+`steamapps`; a manifest alone is reported as a missing installation. In JSON,
+each library is an object holding its `path` and `layout` (`common` or
+`force_install_dir`).
+
+An install forced into a folder that does hold Steam's library files, such as
+steamcmd's own root, is not supported: its manifests are reported as missing
+`steamapps/common` installations.
 
 ## App metadata
 

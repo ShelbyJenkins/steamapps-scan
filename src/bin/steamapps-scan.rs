@@ -18,7 +18,7 @@ use std::{
 use clap::{Parser, Subcommand};
 use steamapps_scan::{
     AppInstall, AttemptOutcome, Diagnostic, DiagnosticSeverity, Discovery, DiscoverySource,
-    DiscoveryState, ExecutablePath, ExecutableQuery, FileVersion, MatchCardinality,
+    DiscoveryState, ExecutablePath, ExecutableQuery, FileVersion, LibraryLayout, MatchCardinality,
     MatchCompleteness, MatchReport,
 };
 
@@ -230,7 +230,8 @@ fn scan(
                 writeln!(out, "steam root: {root}")?;
             }
             for library in discovery.inventory().libraries() {
-                writeln!(out, "library: {library}")?;
+                let layout = describe_layout(library.layout());
+                writeln!(out, "library: {library} ({layout})")?;
             }
             for app in discovery.inventory().apps() {
                 writeln!(out, "{}", describe_app(app))?;
@@ -547,6 +548,14 @@ const fn describe_state(state: DiscoveryState) -> &'static str {
         DiscoveryState::NotFound => "not found",
         DiscoveryState::Unsupported => "unsupported",
         _ => "unknown",
+    }
+}
+
+const fn describe_layout(layout: LibraryLayout) -> &'static str {
+    match layout {
+        LibraryLayout::Common => "apps in steamapps/common",
+        LibraryLayout::ForceInstallDir => "force_install_dir: apps in the library itself",
+        _ => "unknown layout",
     }
 }
 

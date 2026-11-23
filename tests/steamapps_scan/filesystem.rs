@@ -79,6 +79,73 @@ fn linked_install_is_accepted_but_links_out_of_it_are_not() {
 }
 
 #[test]
+fn one_install_reached_through_two_manifests_is_listed_once() {
+    const COPY: u32 = 72;
+    const FORCED: u32 = 73;
+    // Each linking library's manifest sorts first, so only keeping the
+    // library that holds the files picks the other manifest.
+    let linking = TempTree::new("dup-alias");
+    let holding = TempTree::new("dup-owner");
+    let held = holding.install_app(COPY, "Shared");
+    holding.install_executable("Shared", "app.exe");
+    linking.file(
+        format!("steamapps/appmanifest_{COPY}.acf"),
+        TempTree::manifest(COPY, COPY, "Shared", "Shared"),
+    );
+    linking.link_dir("steamapps/common/Shared", &held);
+    let steam = TempTree::new("dup-common");
+    let forced = TempTree::new("dup-forced");
+    forced.file(
+        format!("steamapps/appmanifest_{FORCED}.acf"),
+        TempTree::manifest(FORCED, FORCED, "Forced", "Forced"),
+    );
+    forced.file("Game.exe", "");
+    steam.file(
+        format!("steamapps/appmanifest_{FORCED}.acf"),
+        TempTree::manifest(FORCED, FORCED, "Forced", "Forced"),
+    );
+    steam.link_dir("steamapps/common/Forced", forced.root());
+
+    for (app_id, linking, holding, executable) in [
+        (COPY, &linking, &holding, "app.exe"),
+        (FORCED, &steam, &forced, "Game.exe"),
+    ] {
+        let discovery = Discovery::discover_from([linking.root(), holding.root()]);
+
+        assert_eq!(
+            discovery.state(),
+            DiscoveryState::Complete,
+            "{:#?}",
+            discovery.diagnostics()
+        );
+        let installs: Vec<_> = discovery
+            .inventory()
+            .apps_for(fixture_app_id(app_id))
+            .collect();
+        assert_eq!(installs.len(), 1);
+        let manifest = |tree: &TempTree| {
+            dunce::canonicalize(
+                tree.root()
+                    .join(format!("steamapps/appmanifest_{app_id}.acf")),
+            )
+            .unwrap()
+        };
+        assert_eq!(installs[0].manifest_path().path(), manifest(holding));
+        assert_eq!(installs[0].library_root().path(), holding.root());
+        assert!(discovery.diagnostics().iter().any(|diagnostic| {
+            diagnostic.severity == DiagnosticSeverity::Warning
+                && diagnostic.stage == DiscoveryStage::ValidateInstall
+                && diagnostic.kind == DiagnosticKind::Duplicate
+                && diagnostic.app_id == Some(fixture_app_id(app_id))
+                && diagnostic.path.as_deref() == Some(manifest(linking).as_path())
+        }));
+        let report =
+            discovery.resolve_executable(&ExecutableQuery::new(app_id, executable).unwrap());
+        assert!(report.unique().is_ok(), "{report:#?}");
+    }
+}
+
+#[test]
 fn install_link_to_a_vanished_target_is_reported() {
     const APP_ID: u32 = 71;
     let steam = TempTree::new("dangling-library");
@@ -197,4 +264,46 @@ fn paths_beyond_max_path_resolve_like_any_other() {
             dunce::canonicalize(file).unwrap()
         );
     }
+}
+
+/// Linux refuses a path of 4096 bytes or more, so a root of 4067 bytes puts
+/// `steamapps/libraryfolders.vdf` one byte past the limit while its manifest
+/// lands exactly on the longest allowed path: one marker cannot be inspected
+/// while every other file stays reachable.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_uninspectable_marker_leaves_the_layout_to_the_others() {
+    const APP_ID: u32 = 7;
+    const ROOT_LEN: usize = 4067;
+    let base = TempTree::new("long-marker");
+    let mut root = base.root().to_path_buf();
+    while ROOT_LEN.saturating_sub(root.as_os_str().len()) > 202 {
+        root.push("d".repeat(100));
+    }
+    let last = ROOT_LEN
+        .saturating_sub(root.as_os_str().len())
+        .saturating_sub(1);
+    root.push("d".repeat(last));
+    TempTree::install_app_in(&root, APP_ID, "Game");
+    let manifest = root.join(format!("steamapps/appmanifest_{APP_ID}.acf"));
+    assert_eq!(manifest.as_os_str().len(), 4095);
+
+    let discovery = Discovery::discover_from([root.as_path()]);
+
+    let library = discovery
+        .inventory()
+        .libraries()
+        .iter()
+        .find(|library| library.path() == root.as_path())
+        .expect("the root's own library is kept");
+    assert_eq!(library.layout(), LibraryLayout::Common);
+    assert_eq!(
+        discovery
+            .inventory()
+            .apps_for(fixture_app_id(APP_ID))
+            .count(),
+        1,
+        "{:#?}",
+        discovery.diagnostics()
+    );
 }

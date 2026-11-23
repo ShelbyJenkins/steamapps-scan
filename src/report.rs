@@ -16,7 +16,10 @@ use crate::internal::scan::SteamScan;
 /// A validated Steam application installation.
 ///
 /// App IDs are intentionally not unique in an inventory: the same app can be
-/// installed in libraries reached through different Steam roots.
+/// installed in libraries reached through different Steam roots. Each
+/// installation directory appears once per app, though: of several manifests
+/// that resolve to one directory, the one from the library holding it is kept
+/// and each other leaves a [`DiagnosticKind::Duplicate`] warning.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 #[non_exhaustive]
 pub struct AppInstall {
@@ -205,7 +208,7 @@ pub struct SteamInventory {
 }
 
 impl SteamInventory {
-    /// Validated Steam installations found by the scan.
+    /// Validated Steam roots found by the scan.
     #[must_use]
     pub fn steam_roots(&self) -> &[SteamRoot] {
         &self.steam_roots
@@ -266,11 +269,13 @@ pub enum DiscoveryStage {
     ValidateSteamRoot,
     /// Reading or parsing `libraryfolders.vdf`.
     ReadLibraryFolders,
-    /// Confirming a registered library and its `steamapps` directory.
+    /// Confirming a library, registered or a root's own, with its `steamapps`
+    /// directory and layout.
     ValidateLibrary,
     /// Enumerating, reading, or parsing app manifests.
     ReadManifest,
-    /// Resolving and confining a manifest's installation directory.
+    /// Resolving and confining a manifest's installation directory, and
+    /// merging manifests that resolve to the same one.
     ValidateInstall,
     /// Resolving an executable query inside an app installation.
     ResolveExecutable,
@@ -291,6 +296,8 @@ pub enum DiagnosticKind {
     InvalidData,
     /// A path attempted to leave its permitted directory boundary.
     OutsideBoundary,
+    /// Another manifest already describes the same installation.
+    Duplicate,
     /// The requested automatic operation is unavailable on this platform.
     Unsupported,
 }

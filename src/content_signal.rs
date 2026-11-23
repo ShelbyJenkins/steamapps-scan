@@ -212,7 +212,10 @@ mod tests {
         sync::atomic::{AtomicU32, Ordering},
     };
 
-    use super::{super::paths::LibraryRoot, *};
+    use super::{
+        super::paths::{LibraryLayout, LibraryRoot},
+        *,
+    };
 
     const APP_ID: u32 = 42;
 
@@ -280,7 +283,10 @@ mod tests {
             None,
             "fixture".into(),
             super::super::paths::ManifestPath(path.clone()),
-            LibraryRoot(root.clone()),
+            LibraryRoot {
+                path: root.clone(),
+                layout: LibraryLayout::ForceInstallDir,
+            },
             super::super::paths::InstallDir(root),
             super::super::report::AppMetadata::default(),
         );

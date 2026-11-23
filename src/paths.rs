@@ -45,17 +45,47 @@ macro_rules! path_type {
 }
 
 path_type!(
-    /// A validated Steam installation directory.
+    /// A validated Steam root: a Steam or steamcmd installation directory, or
+    /// any directory whose `steamapps` holds app manifests, such as a folder
+    /// filled by steamcmd's `force_install_dir`.
     SteamRoot
 );
 
-path_type!(
-    /// A validated Steam library directory.
-    LibraryRoot
-);
+/// A validated Steam library directory.
+///
+/// Serializes as an object holding its `path` and `layout`.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Serialize)]
+pub struct LibraryRoot {
+    pub(super) path: PathBuf,
+    pub(super) layout: LibraryLayout,
+}
+
+/// Where a library keeps the apps its manifests describe.
+///
+/// A library that a `libraryfolders.vdf` registers is always `Common`. Only a
+/// root that none registers can be `ForceInstallDir`, and only while it holds
+/// none of the files Steam keeps in its own libraries. An install forced into
+/// a folder that does hold them, such as steamcmd's own root, is therefore not
+/// found: each of its manifests is reported as a missing `steamapps/common`
+/// installation. Supporting it would take a layout decision per manifest,
+/// worth making if such installs turn out to be common.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LibraryLayout {
+    /// Each app in its own `steamapps/common/<installdir>`.
+    Common,
+    /// Every app directly in the library directory, as steamcmd's
+    /// `force_install_dir` leaves it. Apps forced into one directory share it,
+    /// and they count as installed only while it holds something besides
+    /// `steamapps`.
+    ForceInstallDir,
+}
 
 path_type!(
-    /// A canonical app installation directory resolved from a manifest.
+    /// A canonical app installation directory: the manifest's
+    /// `steamapps/common/<installdir>`, or the library itself in the
+    /// `force_install_dir` layout.
     InstallDir
 );
 
@@ -129,7 +159,7 @@ impl ValidationErr {
 impl SteamRoot {
     pub(super) const LIBRARY_FOLDERS_FILE: &str = "libraryfolders.vdf";
 
-    /// Validate a caller-provided Steam installation directory.
+    /// Validate a caller-provided Steam root.
     ///
     /// The directory must contain `steamapps` and either
     /// `libraryfolders.vdf` or at least one `appmanifest_<id>.acf`-shaped
@@ -198,15 +228,46 @@ impl TryFrom<PathBuf> for SteamRoot {
 
 impl LibraryRoot {
     /// Directory under every library, Steam roots included, that holds app
-    /// manifests and the `common` installation directories.
+    /// manifests.
     pub(super) const APPS_DIR: &str = "steamapps";
+    /// Directory under `steamapps` that holds one directory per app in the
+    /// common layout.
+    pub(super) const COMMON_DIR: &str = "common";
+    /// Marker Steam writes into each library it registers, though a Windows
+    /// root's own library can lack it.
+    const LIBRARY_FOLDER_FILE: &str = "libraryfolder.vdf";
 
-    /// Validate a caller-provided Steam library directory.
+    /// Validate a Steam library directory as a `libraryfolders.vdf` slot names
+    /// it. Steam registered it, so its layout is [`LibraryLayout::Common`].
+    ///
+    /// Fails when the directory or its `steamapps` is missing, cannot be
+    /// resolved, or is not a directory.
     pub fn from_dir(path: impl AsRef<Path>) -> Result<Self, ValidationErr> {
         let path = path.as_ref();
         let root = canonical_directory(path, "Steam library root")?;
         canonical_directory(&root.join(Self::APPS_DIR), "Steam library apps directory")?;
-        Ok(Self(root))
+        Ok(Self {
+            path: root,
+            layout: LibraryLayout::Common,
+        })
+    }
+
+    /// Return the validated path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Consume the wrapper and return the owned path.
+    #[must_use]
+    pub fn into_path(self) -> PathBuf {
+        self.path
+    }
+
+    /// Where this library keeps its apps.
+    #[must_use]
+    pub const fn layout(&self) -> LibraryLayout {
+        self.layout
     }
 }
 
@@ -215,6 +276,56 @@ impl TryFrom<PathBuf> for LibraryRoot {
 
     fn try_from(path: PathBuf) -> Result<Self, Self::Error> {
         Self::from_dir(path)
+    }
+}
+
+impl AsRef<Path> for LibraryRoot {
+    fn as_ref(&self) -> &Path {
+        self.path()
+    }
+}
+
+impl fmt::Display for LibraryRoot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.path.display().fmt(formatter)
+    }
+}
+
+impl LibraryLayout {
+    /// The layout of a root that no `libraryfolders.vdf` registers.
+    ///
+    /// Steam keeps `libraryfolders.vdf` in every root, `libraryfolder.vdf` in
+    /// the libraries it registers, and `common` in any library it has
+    /// installed into; steamcmd's `force_install_dir` leaves none of them, and
+    /// any one of them means `Common`. A marker that cannot be inspected
+    /// decides nothing, so it fails the probe, at that marker's path, only
+    /// when no other marker is found.
+    pub(super) fn of(root: &Path) -> Result<Self, ValidationErr> {
+        let steamapps = root.join(LibraryRoot::APPS_DIR);
+        let mut failure = None;
+        for marker in [
+            steamapps.join(SteamRoot::LIBRARY_FOLDERS_FILE),
+            root.join(LibraryRoot::LIBRARY_FOLDER_FILE),
+            steamapps.join(LibraryRoot::COMMON_DIR),
+        ] {
+            match std::fs::symlink_metadata(&marker) {
+                Ok(_) => return Ok(Self::Common),
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    failure.get_or_insert_with(|| {
+                        ValidationErr::new(
+                            ValidationErrKind::Io,
+                            &marker,
+                            format!(
+                                "{}: could not inspect Steam library file: {error}",
+                                marker.display()
+                            ),
+                        )
+                    });
+                }
+            }
+        }
+        failure.map_or(Ok(Self::ForceInstallDir), Err)
     }
 }
 

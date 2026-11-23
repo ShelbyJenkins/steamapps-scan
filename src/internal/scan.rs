@@ -6,7 +6,7 @@
 //! sources in `providers`.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     io::Read,
     num::{NonZeroU32, NonZeroU64},
@@ -19,8 +19,8 @@ use normalize_path::NormalizePath;
 use crate::{
     MAX_STEAM_METADATA_BYTES,
     paths::{
-        FilePresence, InstallDir, LibraryRoot, ManifestPath, SteamRoot, ValidationErrKind,
-        canonical_directory, canonical_starts_with,
+        FilePresence, InstallDir, LibraryLayout, LibraryRoot, ManifestPath, SteamRoot,
+        ValidationErrKind, canonical_directory, canonical_starts_with,
     },
     report::{
         AppInstall, AppMetadata, AttemptEvidence, AttemptOutcome, Diagnostic, DiagnosticKind,
@@ -70,6 +70,7 @@ impl SteamScan {
                     .cmp(right.manifest_path().path())
             })
         });
+        let apps = pipeline.distinct_installs(apps);
 
         Self {
             roots: roots.roots,
@@ -312,11 +313,43 @@ struct ScanPipeline {
 }
 
 impl ScanPipeline {
+    /// Each root's own library followed by the libraries it registers, each
+    /// library once. A registered library has the common layout, even when it
+    /// is also a root, so only a root that no `libraryfolders.vdf` names has
+    /// its layout inferred from its files, whatever the order of the roots.
     fn libraries_from_roots(&mut self, steam_roots: &[SteamRoot]) -> Vec<LibraryRoot> {
+        let registered: Vec<Vec<LibraryRoot>> = steam_roots
+            .iter()
+            .map(|root| self.library_folders(root))
+            .collect();
+        let registered_paths: HashSet<PathKey> = registered
+            .iter()
+            .flatten()
+            .map(|library| PathKey::of(library.path()))
+            .collect();
+
         let mut libraries = Vec::new();
-        for root in steam_roots {
-            libraries.push(LibraryRoot(root.path().to_path_buf()));
-            libraries.extend(self.library_folders(root));
+        for (root, slots) in steam_roots.iter().zip(registered) {
+            let layout = if registered_paths.contains(&PathKey::of(root.path())) {
+                Ok(LibraryLayout::Common)
+            } else {
+                LibraryLayout::of(root.path())
+            };
+            match layout {
+                Ok(layout) => libraries.push(LibraryRoot {
+                    path: root.path().to_path_buf(),
+                    layout,
+                }),
+                Err(error) => {
+                    let kind: DiagnosticKind = error.kind.into();
+                    let message = error.to_string();
+                    self.diagnostics.push(
+                        Diagnostic::error(DiscoveryStage::ValidateLibrary, kind, message)
+                            .with_path(error.path),
+                    );
+                }
+            }
+            libraries.extend(slots);
         }
 
         let mut seen = HashSet::new();
@@ -526,6 +559,58 @@ impl ScanPipeline {
         apps
     }
 
+    /// One install per app and canonical installation directory, so the same
+    /// files reached through a directory link count once while separate
+    /// copies stay separate. Of the manifests that resolve to one directory,
+    /// the one whose library holds the directory is kept, else the first in
+    /// `apps` order, and each other is recorded as a warning.
+    fn distinct_installs(&mut self, apps: Vec<AppInstall>) -> Vec<AppInstall> {
+        let holds_install =
+            |app: &AppInstall| canonical_starts_with(app.path(), app.library_root().path());
+        let mut installs: Vec<(AppInstall, Vec<AppInstall>)> = Vec::with_capacity(apps.len());
+        let mut positions: HashMap<(NonZeroU32, PathKey), usize> = HashMap::new();
+        for app in apps {
+            let key = (app.app_id(), PathKey::of(app.path()));
+            if let Some((kept, duplicates)) = positions
+                .get(&key)
+                .and_then(|&position| installs.get_mut(position))
+            {
+                let duplicate = if holds_install(&app) && !holds_install(kept) {
+                    std::mem::replace(kept, app)
+                } else {
+                    app
+                };
+                duplicates.push(duplicate);
+            } else {
+                positions.insert(key, installs.len());
+                installs.push((app, Vec::new()));
+            }
+        }
+
+        let mut distinct = Vec::with_capacity(installs.len());
+        for (kept, duplicates) in installs {
+            for duplicate in duplicates {
+                self.diagnostics.push(
+                    Diagnostic::warning(
+                        DiscoveryStage::ValidateInstall,
+                        DiagnosticKind::Duplicate,
+                        format!(
+                            "{}: app {} installation '{}' is already listed from {}",
+                            duplicate.manifest_path(),
+                            duplicate.app_id(),
+                            duplicate.path().display(),
+                            kept.manifest_path(),
+                        ),
+                    )
+                    .with_path(duplicate.manifest_path().path())
+                    .with_app_id(duplicate.app_id()),
+                );
+            }
+            distinct.push(kept);
+        }
+        distinct
+    }
+
     fn parse_manifest(
         &mut self,
         library: &LibraryRoot,
@@ -663,10 +748,12 @@ impl ScanPipeline {
         Some(manifest)
     }
 
-    /// Resolve and confine a manifest's `installdir` under the library's
-    /// `steamapps/common`, rejecting lexical and symlink escapes separately.
-    /// Returns the trimmed declared directory and the canonical installation
-    /// directory.
+    /// Resolve a manifest's `installdir` to the canonical installation
+    /// directory, returned with the trimmed declared value. In either layout
+    /// the declared value must be a relative path of plain names. The common
+    /// layout confines it under the library's `steamapps/common`, rejecting
+    /// lexical and symlink escapes separately; a `force_install_dir` library
+    /// is itself the installation directory.
     fn resolve_install_dir(
         &mut self,
         library: &LibraryRoot,
@@ -702,15 +789,23 @@ impl ScanPipeline {
                 )
             })
         {
-            self.reject_install_dir_escape(manifest_path, app_id, manifest_install_dir);
+            self.reject_install_dir(library, manifest_path, app_id, manifest_install_dir);
             return None;
         }
 
-        let common = library.path().join(LibraryRoot::APPS_DIR).join("common");
+        let common = match library.layout() {
+            LibraryLayout::Common => library
+                .path()
+                .join(LibraryRoot::APPS_DIR)
+                .join(LibraryRoot::COMMON_DIR),
+            LibraryLayout::ForceInstallDir => {
+                return self.forced_install_dir(library, declared, app_id);
+            }
+        };
         let normalized_common = common.normalize();
         let candidate = common.join(raw_install).normalize();
         if !candidate.starts_with(&normalized_common) {
-            self.reject_install_dir_escape(manifest_path, app_id, manifest_install_dir);
+            self.reject_install_dir(library, manifest_path, app_id, manifest_install_dir);
             return None;
         }
         let canonical_common = match canonical_directory(&common, "Steam common directory") {
@@ -766,18 +861,77 @@ impl ScanPipeline {
         Some((declared.to_string(), InstallDir(resolved)))
     }
 
-    fn reject_install_dir_escape(
+    /// steamcmd commits a forced app's files straight into the library, so
+    /// `installdir` names nothing on disk and anything besides `steamapps` is
+    /// the only sign of an install. A manifest alone, left by a failed first
+    /// install or copied in, installs nothing.
+    fn forced_install_dir(
         &mut self,
+        library: &LibraryRoot,
+        declared: &str,
+        app_id: NonZeroU32,
+    ) -> Option<(String, InstallDir)> {
+        let committed = std::fs::read_dir(library.path()).and_then(|entries| {
+            for entry in entries {
+                if !entry?
+                    .file_name()
+                    .eq_ignore_ascii_case(LibraryRoot::APPS_DIR)
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        });
+        let (kind, message) = match committed {
+            Ok(true) => {
+                return Some((
+                    declared.to_string(),
+                    InstallDir(library.path().to_path_buf()),
+                ));
+            }
+            Ok(false) => (
+                DiagnosticKind::NotFound,
+                format!(
+                    "{}: no files of app {app_id} are installed beside steamapps",
+                    library.path().display()
+                ),
+            ),
+            Err(error) => (
+                DiagnosticKind::Io,
+                format!(
+                    "{}: could not inspect the installed files of app {app_id}: {error}",
+                    library.path().display()
+                ),
+            ),
+        };
+        self.diagnostics.push(
+            Diagnostic::error(DiscoveryStage::ValidateInstall, kind, message)
+                .with_path(library.path())
+                .with_app_id(app_id),
+        );
+        None
+    }
+
+    fn reject_install_dir(
+        &mut self,
+        library: &LibraryRoot,
         manifest_path: &ManifestPath,
         app_id: NonZeroU32,
         manifest_install_dir: &str,
     ) {
+        let (kind, problem) = match library.layout() {
+            LibraryLayout::Common => (DiagnosticKind::OutsideBoundary, "escapes steamapps/common"),
+            LibraryLayout::ForceInstallDir => (
+                DiagnosticKind::InvalidData,
+                "is not a relative directory name",
+            ),
+        };
         self.diagnostics.push(
             Diagnostic::error(
                 DiscoveryStage::ValidateInstall,
-                DiagnosticKind::OutsideBoundary,
+                kind,
                 format!(
-                    "{}: app {} installdir '{}' escapes steamapps/common",
+                    "{}: app {} installdir '{}' {problem}",
                     manifest_path.path().display(),
                     app_id,
                     manifest_install_dir
@@ -840,7 +994,7 @@ impl ScanPipeline {
                 manifest_path,
                 app_id,
                 "LastUpdated",
-                raw.last_updated.as_deref(),
+                raw.last_updated.or(raw.lastupdated).as_deref(),
             ),
             beta_key: raw.user_config.and_then(|config| {
                 [config.beta_key, config.betakey]
@@ -989,6 +1143,9 @@ struct RawMetadata {
     size_on_disk: Option<String>,
     #[serde(default, rename = "LastUpdated")]
     last_updated: Option<String>,
+    /// steamcmd has written `LastUpdated` in lower case.
+    #[serde(default)]
+    lastupdated: Option<String>,
     #[serde(default, rename = "InstalledDepots")]
     installed_depots: BTreeMap<String, RawDepot>,
     #[serde(default, rename = "UserConfig")]
@@ -1014,20 +1171,23 @@ struct RawUserConfig {
     betakey: Option<String>,
 }
 
-/// Deduplication identity for a canonical root or library path.
+/// Deduplication identity for a canonical root, library, or installation
+/// path.
 #[cfg(any(windows, target_os = "macos"))]
 #[derive(Eq, Hash, PartialEq)]
 struct PathKey(String);
 
-/// Deduplication identity for a canonical root or library path.
+/// Deduplication identity for a canonical root, library, or installation
+/// path.
 #[cfg(not(any(windows, target_os = "macos")))]
 #[derive(Eq, Hash, PartialEq)]
 struct PathKey(PathBuf);
 
 impl PathKey {
     /// NTFS and default APFS are case-insensitive, so deduplication folds case
-    /// on Windows and macOS. On a case-sensitive APFS volume two roots that
-    /// differ only by case would merge; the attempts ledger still records both.
+    /// on Windows and macOS. On a case-sensitive APFS volume two roots or
+    /// installations that differ only by case would merge; the attempts ledger
+    /// and the duplicate warnings still record both.
     #[cfg(any(windows, target_os = "macos"))]
     fn of(path: &Path) -> Self {
         Self(
