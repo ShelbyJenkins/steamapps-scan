@@ -1,5 +1,7 @@
 # steamapps-scan
 
+<img src="assets/steamapps-scan-profile.png" alt="steamapps-scan logo" width="128">
+
 Find the games someone has installed with Steam, and the exact `.exe` inside
 each one. A Rust library, with an optional command-line tool.
 
