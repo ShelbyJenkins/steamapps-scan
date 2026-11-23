@@ -313,6 +313,11 @@ struct ScanPipeline {
 }
 
 impl ScanPipeline {
+    /// What Windows Explorer leaves in the folders it shows. Like the
+    /// dot-prefixed entries other file managers leave, such as macOS's
+    /// `.DS_Store`, they are no sign of an install.
+    const FILE_MANAGER_FILES: [&str; 2] = ["desktop.ini", "Thumbs.db"];
+
     /// Each root's own library followed by the libraries it registers, each
     /// library once. A registered library has the common layout, even when it
     /// is also a root, so only a root that no `libraryfolders.vdf` names has
@@ -550,9 +555,16 @@ impl ScanPipeline {
         }
         manifests.sort_by(|left, right| left.1.cmp(&right.1));
 
+        // Forced apps share the library, so one look at it answers for all.
+        let forced_files = match library.layout() {
+            LibraryLayout::Common => None,
+            LibraryLayout::ForceInstallDir => Some(Self::holds_installed_files(library.path())),
+        };
         let mut apps = Vec::new();
         for (filename_app_id, manifest) in manifests {
-            if let Some(app) = self.parse_manifest(library, filename_app_id, &manifest) {
+            if let Some(app) =
+                self.parse_manifest(library, forced_files.as_ref(), filename_app_id, &manifest)
+            {
                 apps.push(app);
             }
         }
@@ -614,6 +626,7 @@ impl ScanPipeline {
     fn parse_manifest(
         &mut self,
         library: &LibraryRoot,
+        forced_files: Option<&std::io::Result<bool>>,
         filename_app_id: u32,
         manifest_path: &Path,
     ) -> Option<AppInstall> {
@@ -667,8 +680,13 @@ impl ScanPipeline {
             }
         };
         let manifest = self.manifest_identity(&text, &manifest_path, app_id)?;
-        let (manifest_install_dir, install_dir) =
-            self.resolve_install_dir(library, &manifest.installdir, &manifest_path, app_id)?;
+        let (manifest_install_dir, install_dir) = self.resolve_install_dir(
+            library,
+            forced_files,
+            &manifest.installdir,
+            &manifest_path,
+            app_id,
+        )?;
 
         let metadata = self.app_metadata(&text, &manifest_path, app_id);
         Some(AppInstall::from_scanned(
@@ -752,11 +770,12 @@ impl ScanPipeline {
     /// directory, returned with the trimmed declared value. In either layout
     /// the declared value must be a relative path of plain names. The common
     /// layout confines it under the library's `steamapps/common`, rejecting
-    /// lexical and symlink escapes separately; a `force_install_dir` library
-    /// is itself the installation directory.
+    /// lexical and symlink escapes separately; a `force_install_dir` library,
+    /// given with its `forced_files`, is itself the installation directory.
     fn resolve_install_dir(
         &mut self,
         library: &LibraryRoot,
+        forced_files: Option<&std::io::Result<bool>>,
         manifest_install_dir: &str,
         manifest_path: &ManifestPath,
         app_id: NonZeroU32,
@@ -793,15 +812,13 @@ impl ScanPipeline {
             return None;
         }
 
-        let common = match library.layout() {
-            LibraryLayout::Common => library
-                .path()
-                .join(LibraryRoot::APPS_DIR)
-                .join(LibraryRoot::COMMON_DIR),
-            LibraryLayout::ForceInstallDir => {
-                return self.forced_install_dir(library, declared, app_id);
-            }
-        };
+        if let Some(forced_files) = forced_files {
+            return self.forced_install_dir(library, forced_files, declared, app_id);
+        }
+        let common = library
+            .path()
+            .join(LibraryRoot::APPS_DIR)
+            .join(LibraryRoot::COMMON_DIR);
         let normalized_common = common.normalize();
         let candidate = common.join(raw_install).normalize();
         if !candidate.starts_with(&normalized_common) {
@@ -861,28 +878,34 @@ impl ScanPipeline {
         Some((declared.to_string(), InstallDir(resolved)))
     }
 
-    /// steamcmd commits a forced app's files straight into the library, so
+    /// Whether a `force_install_dir` library holds installed files. steamcmd
+    /// commits a forced app's files straight into the library, so
     /// `installdir` names nothing on disk and anything besides `steamapps` is
-    /// the only sign of an install. A manifest alone, left by a failed first
-    /// install or copied in, installs nothing.
+    /// the only sign of an install, except what file managers leave in the
+    /// folders they show. A manifest alone, left by a failed first install or
+    /// copied in, installs nothing.
+    fn holds_installed_files(library: &Path) -> std::io::Result<bool> {
+        for entry in std::fs::read_dir(library)? {
+            let name = entry?.file_name();
+            let file_manager_file = name.as_encoded_bytes().starts_with(b".")
+                || Self::FILE_MANAGER_FILES
+                    .iter()
+                    .any(|file| name.eq_ignore_ascii_case(file));
+            if !file_manager_file && !name.eq_ignore_ascii_case(LibraryRoot::APPS_DIR) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn forced_install_dir(
         &mut self,
         library: &LibraryRoot,
+        forced_files: &std::io::Result<bool>,
         declared: &str,
         app_id: NonZeroU32,
     ) -> Option<(String, InstallDir)> {
-        let committed = std::fs::read_dir(library.path()).and_then(|entries| {
-            for entry in entries {
-                if !entry?
-                    .file_name()
-                    .eq_ignore_ascii_case(LibraryRoot::APPS_DIR)
-                {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        });
-        let (kind, message) = match committed {
+        let (kind, message) = match forced_files {
             Ok(true) => {
                 return Some((
                     declared.to_string(),

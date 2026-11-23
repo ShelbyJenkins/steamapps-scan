@@ -237,9 +237,10 @@ which commits every app straight into the folder. A root that no
 its own libraries (`steamapps/libraryfolders.vdf`, `libraryfolder.vdf`,
 `steamapps/common`) reports the `force_install_dir` layout. Each of its apps is
 installed in the folder itself once the folder holds anything besides
-`steamapps`; a manifest alone is reported as a missing installation. In JSON,
-each library is an object holding its `path` and `layout` (`common` or
-`force_install_dir`).
+`steamapps` and what file managers leave in the folders they show
+(dot-prefixed entries such as `.DS_Store`, `desktop.ini`, and `Thumbs.db`); a
+manifest alone is reported as a missing installation. In JSON, each library is
+an object holding its `path` and `layout` (`common` or `force_install_dir`).
 
 An install forced into a folder that does hold Steam's library files, such as
 steamcmd's own root, is not supported: its manifests are reported as missing

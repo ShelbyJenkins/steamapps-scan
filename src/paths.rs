@@ -78,7 +78,8 @@ pub enum LibraryLayout {
     /// Every app directly in the library directory, as steamcmd's
     /// `force_install_dir` leaves it. Apps forced into one directory share it,
     /// and they count as installed only while it holds something besides
-    /// `steamapps`.
+    /// `steamapps` and what file managers leave in the folders they show,
+    /// such as `.DS_Store` or `desktop.ini`.
     ForceInstallDir,
 }
 

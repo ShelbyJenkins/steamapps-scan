@@ -407,6 +407,10 @@ fn force_install_dir_needs_installed_files_and_a_plain_installdir() {
         format!("steamapps/appmanifest_{MANIFEST_ONLY}.acf"),
         TempTree::manifest(MANIFEST_ONLY, MANIFEST_ONLY, "Game", "Game"),
     );
+    // What file managers leave in a folder they show installs nothing.
+    for leftover in [".DS_Store", "desktop.ini", "Thumbs.db"] {
+        manifest_only.file(leftover, "");
+    }
 
     let discovery = manifest_only.discover();
 

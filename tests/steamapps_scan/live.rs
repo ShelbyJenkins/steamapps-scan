@@ -136,7 +136,7 @@ fn discovery_is_complete_and_every_accepted_candidate_is_a_root() {
 
 #[test]
 #[ignore = "reads this machine's Steam installation"]
-fn every_manifest_on_disk_is_inventoried() {
+fn every_manifest_on_disk_is_inventoried_or_a_duplicate() {
     let LiveSteam(discovery) = LiveSteam::discover();
 
     let mut on_disk = Vec::new();
@@ -151,16 +151,27 @@ fn every_manifest_on_disk_is_inventoried() {
             }
         }
     }
-    let mut inventoried: Vec<PathBuf> = discovery
+    // A manifest whose installation is already listed leaves a warning
+    // naming it instead.
+    let duplicates = discovery
+        .diagnostics()
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.stage == DiscoveryStage::ValidateInstall
+                && diagnostic.kind == DiagnosticKind::Duplicate
+        })
+        .filter_map(|diagnostic| diagnostic.path.clone());
+    let mut listed: Vec<PathBuf> = discovery
         .inventory()
         .apps()
         .iter()
         .map(|app| app.manifest_path().path().to_path_buf())
+        .chain(duplicates)
         .collect();
     on_disk.sort();
-    inventoried.sort();
+    listed.sort();
 
-    assert_eq!(on_disk, inventoried, "{:#?}", discovery.diagnostics());
+    assert_eq!(on_disk, listed, "{:#?}", discovery.diagnostics());
 }
 
 #[test]
