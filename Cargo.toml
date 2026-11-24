@@ -7,7 +7,8 @@ description = "Generic Steam app inventory and executable discovery with validat
 readme = "README.md"
 repository = "https://github.com/ShelbyJenkins/steamapps-scan"
 documentation = "https://docs.rs/steamapps-scan"
-exclude = ["TODO.md"]
+license = "MIT OR Apache-2.0"
+exclude = [".agents/", ".claude/", "AGENTS.md", "CLAUDE.md"]
 keywords = ["steam", "appmanifest", "vdf", "discovery", "executable"]
 categories = ["config", "filesystem"]
 

@@ -2,12 +2,15 @@
 
 <img src="assets/steamapps-scan-profile.png" alt="steamapps-scan logo" width="128">
 
-Find the games someone has installed with Steam, and the exact `.exe` inside
-each one. A Rust library, with an optional command-line tool.
+Find games installed with Steam, and the exact `.exe` inside
+each one on Linux, Mac, and Windows. A command-line tool and Rust library. 
 
-Useful for launchers, mod managers, and anything else that needs to find a
-Steam game on someone's computer. It only reads: it never changes files or
-starts programs.
+Useful for MCP servers, CLI tools, launchers, mod managers, etc. It only reads: it never changes files or
+starts programs. Or just tell your agent to download and use the CLI. Who needs an MCP server anyways?
+
+## Note from the human
+
+I wrote and designed most of this manually for an MCP server I was building. I wanted something a bit more exhaustive with better error handling than `steamlocate`. I got really bored (as one tends to with dealing with multi-platform file searching systems) and decided to try out vibe-coding for a 'real' project, and quickly finished a v1. After a few months working on the MCP server and game project I came back much more experienced with vibe-coding and finished this properly. Yay. So probably everything here is written by Codex or Claude with the exception of this statement. If that bothers you, I understand. That said, I did my due diligence with testing as I would with any other project. 
 
 ## What it does
 
@@ -141,10 +144,8 @@ if let Some(version) = exe.version()? {
 
 ### Command-line tool
 
-Install from a clone of this repository:
-
 ```text
-cargo install --path . --features cli
+cargo install steamapps-scan --features cli
 ```
 
 ```text
@@ -297,3 +298,8 @@ installed through Proton on Linux, and callers need no `cfg`.
 An unsupported platform takes precedence over every other code, and partial
 evidence then takes precedence over a subcommand's own result. A failed
 version read counts as partial evidence.
+
+## License
+
+Licensed under either the [Apache License, Version 2.0](LICENSE-APACHE) or the
+[MIT license](LICENSE-MIT), at your option.
